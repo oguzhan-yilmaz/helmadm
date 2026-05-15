@@ -1,0 +1,6 @@
+.ai
+.venv
+*.pyc
+.vscode/
+
+.pytest_cache/
