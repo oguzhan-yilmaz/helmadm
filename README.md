@@ -1,6 +1,6 @@
 # helmadm
 
-CLI tools for Helm 3 releases stored in Kubernetes: generate Argo CD `Application` YAML, list releases, and compare a release manifest to live cluster objects. No `helm` or `kubectl` binary required.
+CLI tools for Helm 3 releases stored in Kubernetes: generate Argo CD `Application` YAML, export reproducible Helm install bundles, list releases, and compare a release manifest to live cluster objects. No `helm` or `kubectl` binary required for helmadm itself.
 
 ## Requirements
 
@@ -19,12 +19,14 @@ uv sync
 | Command | Purpose |
 |---------|---------|
 | `argocd-yaml` | Print an Argo CD `Application` manifest for a release (stdout) |
+| `pull` | Export a reproducible Helm install bundle (values files + README) |
 | `ls` | List Helm releases in the cluster |
 | `drift` | Compare the release's stored manifest to live objects (read-only) |
 
 ```bash
 uv run helmadm --help
 uv run helmadm argocd-yaml --help
+uv run helmadm pull --help
 uv run helmadm ls --help
 uv run helmadm drift --help
 ```
@@ -46,6 +48,35 @@ uv run helmadm argocd-yaml -n monitoring prometheus \
 ```
 
 `--debug` adds a `.debug` block to the YAML (raw values, diff metadata, `ignoreAnnotations`). Remove it before applying to Argo CD.
+
+### `pull` — reproducible install bundle
+
+Reads a release from cluster storage and writes a directory you can use with plain `helm install` / `helm upgrade` (no helmadm or Argo required for reinstall).
+
+```bash
+uv run helmadm pull -n loki -o ./bundles fluentbit
+```
+
+Creates `./bundles/{namespace}/{release}/` containing:
+
+- `helmadm-pull-metadata.yaml` — when pulled, kubeconfig/context, release and chart info
+- `{chart}.all.values.yaml` — effective values from the cluster (coalesced)
+- `{chart}.changed.values.yaml` — overrides only (diff vs remote chart defaults)
+- `{chart}.remote-all.values.yaml` — chart defaults from the repository
+- `README.md` — helm install/template commands for each values file
+
+Options:
+
+- `--revision N` — pull a specific Helm release revision (default: latest)
+- `--repo-url` — when the release has no `chart.metadata.repoURL` (see `NEEDS_REPO_URL` in `ls`)
+- `--repo-name` — helm repo alias used in the README (default: derived from the repo URL host)
+- `--tar` — write a gzip tarball of the bundle to stdout instead of leaving files on disk
+- `--force` — overwrite an existing bundle directory
+
+```bash
+uv run helmadm pull -n monitoring prometheus --revision 3 -o ./bundles
+uv run helmadm pull -n loki -o ./bundles fluentbit --tar > fluentbit-bundle.tar.gz
+```
 
 ### `ls` — list releases
 
@@ -71,13 +102,13 @@ CLI flags take precedence over env vars.
 
 | Flag | Environment variable |
 |------|----------------------|
-| `-n` / `--namespace` | `HELM_TO_ARGOCD_NAMESPACE` (or current kubeconfig context namespace) |
-| `--context` | `HELM_TO_ARGOCD_CONTEXT` |
-| `--repo-url` | `HELM_TO_ARGOCD_REPO_URL` |
-| release name (positional) | `HELM_TO_ARGOCD_RELEASE_NAME` |
-| (values trace, with `-v`) | `HELM_TO_ARGOCD_TRACE_VALUES` — per-key logs during `argocd-yaml` |
-| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`) |
-| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_READ_TIMEOUT` — read timeout in seconds (default: `60`) |
+| `-n` / `--namespace` | `HELMADM_NAMESPACE` (or current kubeconfig context namespace) |
+| `--context` | `HELMADM_CONTEXT` |
+| `--repo-url` | `HELMADM_REPO_URL` |
+| release name (positional) | `HELMADM_RELEASE_NAME` |
+| (values trace, with `-v`) | `HELMADM_TRACE_VALUES` — per-key logs during `argocd-yaml` |
+| (Kubernetes HTTP) | `HELMADM_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`) |
+| (Kubernetes HTTP) | `HELMADM_K8S_READ_TIMEOUT` — read timeout in seconds (default: `60`) |
 
 `--kubeconfig` follows kubectl: use the flag, or `KUBECONFIG` / `~/.kube/config`.
 

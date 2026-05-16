@@ -4,6 +4,8 @@ from unittest.mock import patch
 import pytest
 from typer.testing import CliRunner
 
+from tests.conftest import make_load_release_and_values_result
+
 from helmadm.cli import CliOptions, _kubernetes_client_kwargs, app, run
 from helmadm.env import (
     ENV_NAMESPACE,
@@ -19,6 +21,7 @@ def test_root_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "argocd-yaml" in result.stdout
+    assert "pull" in result.stdout
     assert "ls" in result.stdout
     assert "drift" in result.stdout
     assert "--verbose" in result.stdout
@@ -30,6 +33,7 @@ def test_no_args_shows_root_help(clean_env):
     assert result.exit_code in (0, 2)
     assert "Usage:" in result.stdout
     assert "argocd-yaml" in result.stdout
+    assert "pull" in result.stdout
     assert "ls" in result.stdout
     assert "drift" in result.stdout
 
@@ -64,8 +68,10 @@ def test_argocd_yaml_accepts_verbose_after_arguments(clean_env, monkeypatch):
     }
     with (
         patch("helmadm.cli.load_kubernetes_client"),
-        patch("helmadm.cli.get_release", return_value=release),
-        patch("helmadm.cli.fetch_remote_chart_values", return_value={}),
+        patch(
+            "helmadm.cli._load_release_and_values",
+            return_value=make_load_release_and_values_result(release),
+        ),
         patch("helmadm.cli.render_application", return_value=""),
     ):
         result = runner.invoke(
@@ -101,10 +107,11 @@ def test_argocd_yaml_debug_includes_debug_block(clean_env, monkeypatch):
 
     with (
         patch("helmadm.cli.load_kubernetes_client"),
-        patch("helmadm.cli.get_release", return_value=release),
         patch(
-            "helmadm.cli.fetch_remote_chart_values",
-            return_value={"foo": "default"},
+            "helmadm.cli._load_release_and_values",
+            return_value=make_load_release_and_values_result(
+                release, remote_defaults={"foo": "default"}
+            ),
         ),
     ):
         result = runner.invoke(app, ["argocd-yaml", "--debug", "-n", "ns", "app"])
@@ -137,10 +144,10 @@ def test_parse_from_environment(clean_env, monkeypatch):
 
     with (
         patch("helmadm.cli.load_kubernetes_client"),
-        patch("helmadm.cli.get_release") as get_release,
+        patch("helmadm.cli._load_release_and_values") as load_values,
         patch("helmadm.cli.render_application", return_value=""),
     ):
-        get_release.return_value = {
+        release = {
             "name": "prometheus",
             "config": {},
             "chart": {
@@ -152,6 +159,7 @@ def test_parse_from_environment(clean_env, monkeypatch):
                 "values": {},
             },
         }
+        load_values.return_value = make_load_release_and_values_result(release)
         result = runner.invoke(app, ["argocd-yaml", "prometheus"])
 
     assert result.exit_code == 0
@@ -166,10 +174,10 @@ def test_kubeconfig_not_set_from_kubeconfig_env(clean_env, monkeypatch, tmp_path
 
     with (
         patch("helmadm.cli.load_kubernetes_client") as load_client,
-        patch("helmadm.cli.get_release") as get_release,
+        patch("helmadm.cli._load_release_and_values") as load_values,
         patch("helmadm.cli.render_application", return_value=""),
     ):
-        get_release.return_value = {
+        release = {
             "name": "app",
             "config": {},
             "chart": {
@@ -181,6 +189,7 @@ def test_kubeconfig_not_set_from_kubeconfig_env(clean_env, monkeypatch, tmp_path
                 "values": {},
             },
         }
+        load_values.return_value = make_load_release_and_values_result(release)
         result = runner.invoke(app, ["argocd-yaml", "app"])
 
     assert result.exit_code == 0
@@ -195,10 +204,10 @@ def test_explicit_kubeconfig_flag(clean_env, monkeypatch, tmp_path):
 
     with (
         patch("helmadm.cli.load_kubernetes_client") as load_client,
-        patch("helmadm.cli.get_release") as get_release,
+        patch("helmadm.cli._load_release_and_values") as load_values,
         patch("helmadm.cli.render_application", return_value=""),
     ):
-        get_release.return_value = {
+        release = {
             "name": "app",
             "config": {},
             "chart": {
@@ -210,6 +219,7 @@ def test_explicit_kubeconfig_flag(clean_env, monkeypatch, tmp_path):
                 "values": {},
             },
         }
+        load_values.return_value = make_load_release_and_values_result(release)
         result = runner.invoke(
             app, ["argocd-yaml", "--kubeconfig", str(kubeconfig), "app"]
         )
@@ -236,10 +246,10 @@ def test_cli_overrides_environment(clean_env, monkeypatch):
 
     with (
         patch("helmadm.cli.load_kubernetes_client"),
-        patch("helmadm.cli.get_release") as get_release,
+        patch("helmadm.cli._load_release_and_values") as load_values,
         patch("helmadm.cli.render_application", return_value=""),
     ):
-        get_release.return_value = {
+        release = {
             "name": "from-cli-release",
             "config": {},
             "chart": {
@@ -251,13 +261,14 @@ def test_cli_overrides_environment(clean_env, monkeypatch):
                 "values": {},
             },
         }
+        load_values.return_value = make_load_release_and_values_result(release)
         result = runner.invoke(
             app, ["argocd-yaml", "-n", "from-cli", "from-cli-release"]
         )
 
     assert result.exit_code == 0
-    get_release.assert_called_once()
-    assert get_release.call_args[0][1:] == ("from-cli", "from-cli-release")
+    load_values.assert_called_once()
+    assert load_values.call_args[0][1:3] == ("from-cli", "from-cli-release")
 
 
 def test_missing_namespace_exits_with_error(clean_env, monkeypatch):
@@ -283,10 +294,10 @@ def test_run_passes_no_kubeconfig_to_client(clean_env, monkeypatch):
     options = CliOptions(namespace="ns", release_name="app")
     with (
         patch("helmadm.cli.load_kubernetes_client") as load_client,
-        patch("helmadm.cli.get_release") as get_release,
+        patch("helmadm.cli._load_release_and_values") as load_values,
         patch("helmadm.cli.render_application", return_value=""),
     ):
-        get_release.return_value = {
+        release = {
             "name": "app",
             "config": {},
             "chart": {
@@ -298,6 +309,7 @@ def test_run_passes_no_kubeconfig_to_client(clean_env, monkeypatch):
                 "values": {},
             },
         }
+        load_values.return_value = make_load_release_and_values_result(release)
         assert run(options) == 0
 
     load_client.assert_called_once_with()

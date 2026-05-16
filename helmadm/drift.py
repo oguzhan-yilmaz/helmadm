@@ -106,8 +106,11 @@ _HELM_INSTALL_ONLY_ANNOTATION_KEYS = frozenset(
 _KUBECTL_RUNTIME_ANNOTATION_KEYS = frozenset(
     {
         "kubectl.kubernetes.io/restartedAt",
+        "kubectl.kubernetes.io/last-applied-configuration",
     }
 )
+
+_REPLICA_AWARE_KINDS = frozenset({"Deployment", "ReplicaSet", "StatefulSet"})
 
 _HELM_MANAGED_BY_LABEL_KEY = "app.kubernetes.io/managed-by"
 
@@ -151,6 +154,11 @@ def drift_ignore_annotation_lines(kind: str) -> list[str]:
             "# helmadm: Pod / embedded Pod spec: strip common API defaults (schedulerName, "
             "dnsPolicy, hostNetwork, ...), empty securityContext/resources, redundant "
             "serviceAccount when serviceAccountName is set."
+        )
+    if kind in _REPLICA_AWARE_KINDS:
+        lines.append(
+            "# helmadm: Workload spec.replicas is compared explicitly (omitted in manifest "
+            "means default 1 for Deployment/StatefulSet/ReplicaSet)."
         )
     return lines
 
@@ -330,6 +338,38 @@ def _strip_service_runtime_fields(
         for entry in ports:
             if isinstance(entry, dict):
                 entry.pop("nodePort", None)
+
+
+def effective_spec_replicas(obj: dict[str, Any]) -> int | None:
+    """
+    Desired replica count from spec.replicas, or Kubernetes default (1) when omitted.
+
+    Returns None for kinds that do not use spec.replicas.
+    """
+    kind = obj.get("kind")
+    if kind not in _REPLICA_AWARE_KINDS:
+        return None
+    spec = obj.get("spec")
+    if not isinstance(spec, dict):
+        return 1
+    if "replicas" in spec:
+        value = spec["replicas"]
+        if value is None:
+            return 1
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return 1
+
+
+def replicas_mismatch(manifest_obj: dict[str, Any], live_obj: dict[str, Any]) -> bool:
+    """True when both sides have a replica model and counts differ."""
+    manifest_replicas = effective_spec_replicas(manifest_obj)
+    live_replicas = effective_spec_replicas(live_obj)
+    if manifest_replicas is None or live_replicas is None:
+        return False
+    return manifest_replicas != live_replicas
 
 
 def normalize_for_compare(
@@ -665,7 +705,17 @@ def run_drift(
             continue
 
         live_norm = normalize_for_compare(live, drift_side="live")
-        if expected_norm_dict == live_norm:
+        replica_drift = replicas_mismatch(obj, live)
+        if replica_drift:
+            logger.debug(
+                "replica drift %s/%s %s: manifest=%s live=%s",
+                kind,
+                nm,
+                ns_eff or release_namespace,
+                effective_spec_replicas(obj),
+                effective_spec_replicas(live),
+            )
+        if expected_norm_dict == live_norm and not replica_drift:
             report.items.append(
                 ManifestObjectResult(
                     api_version=api_version,
@@ -676,6 +726,12 @@ def run_drift(
                 )
             )
         else:
+            detail = "release manifest differs from live object spec/metadata"
+            if replica_drift:
+                detail = (
+                    f"spec.replicas differs (manifest "
+                    f"{effective_spec_replicas(obj)}, live {effective_spec_replicas(live)})"
+                )
             report.items.append(
                 ManifestObjectResult(
                     api_version=api_version,
@@ -683,7 +739,7 @@ def run_drift(
                     namespace=(ns_eff or release_namespace),
                     name=nm,
                     severity="drift",
-                    detail="release manifest differs from live object spec/metadata",
+                    detail=detail,
                     diff=_unified_yaml_diff(
                         obj,
                         live,
@@ -717,7 +773,7 @@ def format_report_text(
     lines.append(hr)
     lines.append(
         f"Helm drift: release {report.release_name!r} "
-        f"namespace {report.namespace!r} (manifest vs live; read-only)"
+        f"namespace {report.namespace!r} (stored release manifest vs live API; read-only)"
     )
     if ignore_annotations:
         lines.append(

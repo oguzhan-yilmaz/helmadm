@@ -259,17 +259,17 @@ def list_releases(
     return summaries
 
 
-def find_latest_release_secret(
+def _list_release_secrets(
     api: CoreV1Api,
     namespace: str,
     release_name: str,
-) -> V1Secret:
+) -> list[V1Secret]:
     label_selector = (
         f"{HELM_RELEASE_LABEL_OWNER}={HELM_RELEASE_OWNER},"
         f"{HELM_RELEASE_LABEL_NAME}={release_name}"
     )
     logger.debug(
-        "finding latest secret for release=%r namespace=%r selector=%r",
+        "listing secrets for release=%r namespace=%r selector=%r",
         release_name,
         namespace,
         label_selector,
@@ -281,30 +281,72 @@ def find_latest_release_secret(
         _request_timeout=timeout,
     ).items
     logger.debug("found %d matching secret(s)", len(secrets))
-
     helm_secrets = [secret for secret in secrets if _is_helm_release_secret(secret)]
     logger.debug("%d secret(s) are helm release secrets", len(helm_secrets))
+    return helm_secrets
 
+
+def find_release_secret(
+    api: CoreV1Api,
+    namespace: str,
+    release_name: str,
+    revision: int | None = None,
+) -> V1Secret:
+    helm_secrets = _list_release_secrets(api, namespace, release_name)
     if not helm_secrets:
         raise HelmReleaseNotFoundError(
             f"helm release {release_name!r} not found in namespace {namespace!r}"
         )
 
-    latest = max(helm_secrets, key=_revision)
+    if revision is None:
+        selected = max(helm_secrets, key=_revision)
+        logger.debug(
+            "selected latest secret %r revision %d",
+            selected.metadata.name,
+            _revision(selected),
+        )
+        return selected
+
+    matches = [secret for secret in helm_secrets if _revision(secret) == revision]
+    if not matches:
+        available = sorted(_revision(secret) for secret in helm_secrets)
+        raise HelmReleaseNotFoundError(
+            f"helm release {release_name!r} revision {revision} not found in "
+            f"namespace {namespace!r}; available revisions: {available}"
+        )
+    selected = matches[0]
     logger.debug(
         "selected secret %r revision %d",
-        latest.metadata.name,
-        _revision(latest),
+        selected.metadata.name,
+        _revision(selected),
     )
-    return latest
+    return selected
+
+
+def find_latest_release_secret(
+    api: CoreV1Api,
+    namespace: str,
+    release_name: str,
+) -> V1Secret:
+    return find_release_secret(api, namespace, release_name, revision=None)
+
+
+def helm_revision_from_secret(secret: V1Secret) -> int:
+    return _revision(secret)
 
 
 def get_release(
     api: CoreV1Api,
     namespace: str,
     release_name: str,
+    revision: int | None = None,
 ) -> dict[str, Any]:
-    logger.debug("fetching release %r in namespace %r", release_name, namespace)
-    secret = find_latest_release_secret(api, namespace, release_name)
+    logger.debug(
+        "fetching release %r in namespace %r revision=%s",
+        release_name,
+        namespace,
+        revision,
+    )
+    secret = find_release_secret(api, namespace, release_name, revision=revision)
     encoded = secret.data[HELM_RELEASE_DATA_KEY]
     return decode_release_data(encoded, expected_name=release_name)

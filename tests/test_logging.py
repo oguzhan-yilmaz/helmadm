@@ -14,6 +14,7 @@ from helmadm.logging_config import (
     trace_values,
 )
 from helmadm.values_diff import diff_values
+from tests.conftest import make_load_release_and_values_result
 
 runner = CliRunner()
 
@@ -64,7 +65,10 @@ def test_setup_logging_default_is_warning():
 def test_verbose_flag_enables_debug_logging():
     with (
         patch("helmadm.cli.load_kubernetes_client"),
-        patch("helmadm.cli.get_release", return_value=_SAMPLE_RELEASE),
+        patch(
+            "helmadm.cli._load_release_and_values",
+            return_value=make_load_release_and_values_result(_SAMPLE_RELEASE),
+        ),
         patch("helmadm.cli.render_application", return_value=""),
     ):
         result = runner.invoke(
@@ -80,7 +84,10 @@ def test_verbose_flag_enables_debug_logging():
 def test_without_verbose_uses_warning_level():
     with (
         patch("helmadm.cli.load_kubernetes_client"),
-        patch("helmadm.cli.get_release", return_value=_SAMPLE_RELEASE),
+        patch(
+            "helmadm.cli._load_release_and_values",
+            return_value=make_load_release_and_values_result(_SAMPLE_RELEASE),
+        ),
         patch("helmadm.cli.render_application", return_value=""),
     ):
         result = runner.invoke(app, ["argocd-yaml", "-n", "ns", "app"])

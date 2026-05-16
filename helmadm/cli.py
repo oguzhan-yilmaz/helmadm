@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
@@ -29,10 +30,23 @@ from helmadm.env import (
 )
 from helmadm.chart_values import ChartValuesFetchError, fetch_remote_chart_values
 from helmadm.helm_release import (
+    HELM_RELEASE_DATA_KEY,
     HelmReleaseDecodeError,
     HelmReleaseNotFoundError,
+    _release_status,
+    decode_release_data,
+    find_release_secret,
     get_release,
+    helm_revision_from_secret,
     list_releases,
+)
+from helmadm.pull_bundle import (
+    PullBundleExistsError,
+    build_pull_bundle,
+    build_pull_bundle_files,
+    kubernetes_context_for_pull,
+    write_pull_bundle,
+    write_pull_bundle_tar,
 )
 from helmadm.drift import format_report_text, parse_release_manifest, run_drift
 from helmadm.k8s import (
@@ -43,6 +57,7 @@ from helmadm.k8s import (
 )
 from helmadm.ls_output import format_release_list
 from helmadm.values_diff import (
+    ValuesStrategy,
     build_values_debug,
     cluster_values_from_release,
     extract_values_from_release,
@@ -99,6 +114,7 @@ def main(
     Commands:
 
       [cyan]argocd-yaml[/cyan]  Build an Argo CD Application manifest from a release
+      [cyan]pull[/cyan]         Export a reproducible Helm install bundle (values + README)
       [cyan]ls[/cyan]           List Helm releases (Helm 3 secret storage)
       [cyan]drift[/cyan]        Compare the release's stored manifest to live objects (read-only)
     """
@@ -129,6 +145,72 @@ class CliOptions:
     debug: bool = False
 
 
+@dataclass(frozen=True)
+class PullCliOptions:
+    namespace: str
+    release_name: str
+    output_parent: Path
+    repo_url: str | None = None
+    repo_name: str | None = None
+    revision: int | None = None
+    context: str | None = None
+    kubeconfig: Path | None = None
+    force: bool = False
+    tar: bool = False
+
+
+def _load_release_and_values(
+    api: Any,
+    namespace: str,
+    release_name: str,
+    repo_url_override: str | None,
+    *,
+    revision: int | None = None,
+) -> tuple[
+    dict[str, Any],
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    ValuesStrategy,
+    int,
+    str | None,
+]:
+    secret = find_release_secret(
+        api, namespace, release_name, revision=revision
+    )
+    helm_revision = helm_revision_from_secret(secret)
+    status = _release_status(secret)
+    encoded = secret.data[HELM_RELEASE_DATA_KEY]
+    release = decode_release_data(encoded, expected_name=release_name)
+
+    repo_url = resolve_repo_url(release, repo_url_override)
+
+    chart_metadata = release.get("chart", {}).get("metadata", {})
+    chart_name = chart_metadata.get("name")
+    chart_version = chart_metadata.get("version")
+    if not chart_name or not chart_version:
+        raise ValueError("release chart metadata is missing name or version")
+
+    cluster_values = cluster_values_from_release(release)
+    remote_defaults = fetch_remote_chart_values(
+        repo_url, chart_name, chart_version
+    )
+    values_object, values_strategy = resolve_values_object(
+        cluster_values, remote_defaults
+    )
+    return (
+        release,
+        repo_url,
+        cluster_values,
+        remote_defaults,
+        values_object,
+        values_strategy,
+        helm_revision,
+        status,
+    )
+
+
 def run(options: CliOptions) -> int:
     logger.debug(
         "argocd-yaml: namespace=%r release=%r repo_url=%r context=%r kubeconfig=%s",
@@ -152,7 +234,21 @@ def run(options: CliOptions) -> int:
         return 1
 
     try:
-        release = get_release(api, options.namespace, options.release_name)
+        (
+            release,
+            repo_url,
+            cluster_values,
+            remote_defaults,
+            values_object,
+            values_strategy,
+            _helm_revision,
+            _status,
+        ) = _load_release_and_values(
+            api,
+            options.namespace,
+            options.release_name,
+            options.repo_url,
+        )
     except HelmReleaseNotFoundError as exc:
         logger.debug("release not found: %s", exc)
         typer.echo(str(exc), err=True)
@@ -161,57 +257,32 @@ def run(options: CliOptions) -> int:
         logger.debug("release decode failed: %s", exc)
         typer.echo(str(exc), err=True)
         return 1
-
-    logger.debug("argocd-yaml pipeline: release decoded and validated")
-
-    try:
-        repo_url = resolve_repo_url(release, options.repo_url)
     except RepoURLMissingError as exc:
         logger.debug("repo URL missing: %s", exc)
         typer.echo(str(exc), err=True)
         return 1
-
-    logger.debug("argocd-yaml pipeline: repo URL resolved to %r", repo_url)
-
-    try:
-        user_values, chart_values = extract_values_from_release(release)
-        cluster_values = cluster_values_from_release(release)
-    except TypeError as exc:
-        logger.debug("values extraction failed: %s", exc)
-        typer.echo(str(exc), err=True)
+    except (TypeError, ValueError) as exc:
+        logger.debug("values load failed: %s", exc)
+        typer.echo(f"Error: {exc}", err=True)
         return 1
-
-    chart_metadata = release.get("chart", {}).get("metadata", {})
-    chart_name = chart_metadata.get("name")
-    chart_version = chart_metadata.get("version")
-    if not chart_name or not chart_version:
-        typer.echo(
-            "Error: release chart metadata is missing name or version",
-            err=True,
-        )
-        return 1
-
-    logger.debug("argocd-yaml pipeline: fetching remote chart defaults from %r", repo_url)
-    try:
-        remote_defaults = fetch_remote_chart_values(
-            repo_url, chart_name, chart_version
-        )
     except ChartValuesFetchError as exc:
         logger.debug("remote chart values fetch failed: %s", exc)
         typer.echo(str(exc), err=True)
         return 1
 
-    logger.debug(
-        "argocd-yaml pipeline: diffing cluster values against remote chart defaults"
-    )
-    values_object, values_strategy = resolve_values_object(
-        cluster_values, remote_defaults
-    )
+    logger.debug("argocd-yaml pipeline: release decoded and values loaded")
     logger.debug(
         "argocd-yaml pipeline: valuesObject strategy=%r with %d top-level key(s)",
         values_strategy,
         len(values_object),
     )
+
+    try:
+        user_values, chart_values = extract_values_from_release(release)
+    except TypeError as exc:
+        logger.debug("values extraction failed: %s", exc)
+        typer.echo(str(exc), err=True)
+        return 1
 
     debug_info = None
     if options.debug:
@@ -239,6 +310,119 @@ def run(options: CliOptions) -> int:
     rendered = render_application(manifest)
     logger.debug("argocd-yaml pipeline: rendered manifest (%d bytes)", len(rendered))
     sys.stdout.write(rendered)
+    return 0
+
+
+def run_pull(options: PullCliOptions) -> int:
+    logger.debug(
+        "pull: namespace=%r release=%r output=%s revision=%s tar=%s force=%s",
+        options.namespace,
+        options.release_name,
+        options.output_parent,
+        options.revision,
+        options.tar,
+        options.force,
+    )
+    client_kwargs = _kubernetes_client_kwargs(
+        kubeconfig=options.kubeconfig,
+        context=options.context,
+    )
+    try:
+        api = load_kubernetes_client(**client_kwargs)
+        check_kubernetes_accessible(api)
+    except KubernetesApiError as exc:
+        logger.debug("kubernetes unavailable: %s", exc)
+        typer.echo(f"Error: {exc}", err=True)
+        return 1
+
+    try:
+        (
+            release,
+            repo_url,
+            cluster_values,
+            remote_defaults,
+            values_object,
+            values_strategy,
+            helm_revision,
+            status,
+        ) = _load_release_and_values(
+            api,
+            options.namespace,
+            options.release_name,
+            options.repo_url,
+            revision=options.revision,
+        )
+    except HelmReleaseNotFoundError as exc:
+        typer.echo(str(exc), err=True)
+        return 1
+    except HelmReleaseDecodeError as exc:
+        typer.echo(str(exc), err=True)
+        return 1
+    except RepoURLMissingError as exc:
+        typer.echo(str(exc), err=True)
+        return 1
+    except (TypeError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        return 1
+    except ChartValuesFetchError as exc:
+        typer.echo(str(exc), err=True)
+        return 1
+
+    chart_metadata = release.get("chart", {}).get("metadata", {})
+    chart_name = chart_metadata.get("name")
+    chart_version = chart_metadata.get("version")
+    raw_repo_url = chart_metadata.get("repoURL") or ""
+    oci_chart = isinstance(raw_repo_url, str) and raw_repo_url.startswith("oci://")
+
+    bundle = build_pull_bundle(
+        namespace=options.namespace,
+        release_name=options.release_name,
+        helm_revision=helm_revision,
+        chart_name=chart_name,
+        chart_version=chart_version,
+        repo_url=repo_url,
+        repo_alias=options.repo_name,
+        status=status,
+        oci_chart=oci_chart,
+    )
+    k8s_ctx = kubernetes_context_for_pull(
+        kubeconfig=options.kubeconfig,
+        context=options.context,
+    )
+    files = build_pull_bundle_files(
+        bundle,
+        cluster_values=cluster_values,
+        values_object=values_object,
+        remote_defaults=remote_defaults,
+        kubernetes=k8s_ctx,
+        values_strategy=values_strategy,
+    )
+
+    if options.tar:
+        with tempfile.TemporaryDirectory() as temp_parent:
+            temp_root = Path(temp_parent)
+            bundle_dir = write_pull_bundle(
+                temp_root,
+                bundle,
+                files,
+                force=True,
+            )
+            tarball = write_pull_bundle_tar(temp_root, bundle_dir)
+        sys.stdout.buffer.write(tarball)
+        return 0
+
+    try:
+        bundle_dir = write_pull_bundle(
+            options.output_parent,
+            bundle,
+            files,
+            force=options.force,
+        )
+    except PullBundleExistsError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        return 1
+
+    typer.echo(bundle_dir)
     return 0
 
 
@@ -596,7 +780,12 @@ def drift_command(
     ] = False,
 ) -> None:
     """
-    Compare each object in the Helm release [cyan]manifest[/cyan] to the live API object (read-only).
+    Compare each object in the Helm release [cyan]manifest[/cyan] (from the latest revision secret)
+    to a fresh live API [cyan]GET[/cyan] — there is no cache between runs.
+
+    [cyan]kubectl scale[/cyan] / replica edits on [cyan]Deployment[/cyan], [cyan]StatefulSet[/cyan], or
+    [cyan]ReplicaSet[/cyan] objects in the manifest should appear as drift unless a controller
+    (e.g. HPA, GitOps) reconciles them back before you run this command.
 
     Does **not** run helm upgrade or kubectl apply. Helm hook manifests are not in [cyan]manifest[/cyan]
     and are not checked.
@@ -664,6 +853,192 @@ def drift_command(
             ignore_annotations=ignore_annotations,
         )
     )
+
+
+@app.command(
+    "pull",
+    help="Write a reproducible Helm install bundle (values files + README) from a release.",
+)
+def pull(
+    ctx: typer.Context,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "-v",
+            "--verbose",
+            help="Debug logging on stderr.",
+            rich_help_panel=PANEL_GLOBAL,
+        ),
+    ] = False,
+    release_name: Annotated[
+        str | None,
+        typer.Argument(
+            help=f"Helm release name (positional). [env: {ENV_RELEASE_NAME}]",
+        ),
+    ] = None,
+    namespace: Annotated[
+        str | None,
+        typer.Option(
+            "-n",
+            "--namespace",
+            help=(
+                "Namespace of the Helm release. "
+                f"Default: ${ENV_NAMESPACE}, else the current kubeconfig context namespace."
+            ),
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "-o",
+            "--output",
+            file_okay=False,
+            dir_okay=True,
+            writable=True,
+            resolve_path=True,
+            help=(
+                "Parent directory for the bundle. Creates "
+                "{namespace}/{release}/ inside it."
+            ),
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = None,
+    revision: Annotated[
+        int | None,
+        typer.Option(
+            "--revision",
+            min=1,
+            help="Helm release revision to pull (default: latest).",
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = None,
+    kubeconfig: Annotated[
+        Path | None,
+        typer.Option(
+            "--kubeconfig",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help=(
+                "Kubeconfig file. If omitted, uses "
+                f"${ENV_KUBECONFIG} or ~/.kube/config (kubectl behavior)."
+            ),
+            rich_help_panel=PANEL_KUBERNETES,
+        ),
+    ] = None,
+    context: Annotated[
+        str | None,
+        typer.Option(
+            "--context",
+            help=f"Kubeconfig context. [env: {ENV_CONTEXT}]",
+            rich_help_panel=PANEL_KUBERNETES,
+        ),
+    ] = None,
+    repo_url: Annotated[
+        str | None,
+        typer.Option(
+            "--repo-url",
+            help=(
+                "Chart repository URL when the release has no chart.metadata.repoURL "
+                "(see NEEDS_REPO_URL in helmadm ls). "
+                f"[env: {ENV_REPO_URL}]"
+            ),
+            rich_help_panel=PANEL_CHART,
+        ),
+    ] = None,
+    repo_name: Annotated[
+        str | None,
+        typer.Option(
+            "--repo-name",
+            help="Helm repo alias for README commands (default: derived from repo URL host).",
+            rich_help_panel=PANEL_CHART,
+        ),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Overwrite an existing bundle directory.",
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = False,
+    tar: Annotated[
+        bool,
+        typer.Option(
+            "--tar",
+            help="Write a gzip tarball of the bundle to stdout (no files left on disk).",
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = False,
+) -> None:
+    """
+    Export a **local bundle** from a Helm 3 release so it can be reinstalled with plain helm.
+
+    Writes [cyan]{namespace}/{release}/[/cyan] under [cyan]-o[/cyan] / [cyan]--output[/cyan]:
+
+    - [cyan]helmadm-pull-metadata.yaml[/cyan] — when pulled, kubeconfig/context, release and chart info
+    - [cyan]{chart}.all.values.yaml[/cyan] — effective cluster values (coalesced)
+    - [cyan]{chart}.changed.values.yaml[/cyan] — overrides only (diff vs remote chart defaults)
+    - [cyan]{chart}.remote-all.values.yaml[/cyan] — chart defaults from the repository
+    - [cyan]README.md[/cyan] — helm install/template commands for each values file
+
+    \b
+    Examples:
+
+      helmadm pull -n loki -o ./bundles fluentbit
+      helmadm pull -n monitoring prometheus --revision 3 -o ./bundles
+      helmadm pull -n loki -o ./bundles fluentbit --tar > fluentbit-bundle.tar.gz
+    """
+    _apply_command_verbose(verbose)
+    resolved_namespace = resolve_namespace(namespace, kubeconfig)
+    resolved_release_name = resolve_release_name(release_name)
+    resolved_context = resolve_context(context)
+    resolved_repo_url = resolve_repo_url_option(repo_url)
+
+    if not resolved_namespace and not resolved_release_name and output is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(0)
+
+    if not resolved_namespace:
+        typer.echo(
+            "Error: namespace is required. Use -n/--namespace, "
+            f"{ENV_NAMESPACE}, or set a default namespace in your kubeconfig context.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if not resolved_release_name:
+        typer.echo(
+            f"Error: release name is required. Pass it as an argument or set "
+            f"{ENV_RELEASE_NAME}.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if output is None and not tar:
+        typer.echo(
+            "Error: --output / -o is required (unless using --tar).",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if output is None and tar:
+        output_parent = Path(tempfile.gettempdir())
+    else:
+        output_parent = output
+
+    options = PullCliOptions(
+        namespace=resolved_namespace,
+        release_name=resolved_release_name,
+        output_parent=output_parent,
+        repo_url=resolved_repo_url,
+        repo_name=repo_name,
+        revision=revision,
+        context=resolved_context,
+        kubeconfig=kubeconfig,
+        force=force,
+        tar=tar,
+    )
+    raise typer.Exit(run_pull(options))
 
 
 @app.command(

@@ -6,10 +6,13 @@ import copy
 from unittest.mock import patch
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from helmadm.cli import app
 from helmadm.drift import (
+    effective_spec_replicas,
+    replicas_mismatch,
     DriftReport,
     ManifestObjectResult,
     _should_skip_extras_list_item,
@@ -339,6 +342,71 @@ def test_normalize_strips_deployment_controller_and_pod_defaults() -> None:
         noisy,
         drift_side="live",
     )
+
+
+def test_effective_spec_replicas_defaults_when_omitted() -> None:
+    deployment = {
+        "kind": "Deployment",
+        "spec": {"template": {"spec": {"containers": [{"name": "c", "image": "i"}]}}},
+    }
+    assert effective_spec_replicas(deployment) == 1
+    assert effective_spec_replicas({"kind": "ConfigMap", "data": {}}) is None
+
+
+def test_replicas_mismatch_detects_scaled_deployment() -> None:
+    manifest = {
+        "kind": "Deployment",
+        "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "c", "image": "i"}]}}},
+    }
+    live = copy.deepcopy(manifest)
+    live["spec"]["replicas"] = 5
+    assert replicas_mismatch(manifest, live)
+    assert normalize_for_compare(manifest, drift_side="manifest") != normalize_for_compare(
+        live, drift_side="live"
+    )
+
+
+def test_run_drift_detects_deployment_replica_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_doc = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "app", "namespace": "monitoring"},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": "app"}},
+            "template": {
+                "metadata": {"labels": {"app": "app"}},
+                "spec": {"containers": [{"name": "c", "image": "img:latest"}]},
+            },
+        },
+    }
+    release = {
+        "name": "prometheus",
+        "manifest": "---\n" + yaml.dump(manifest_doc, default_flow_style=False),
+    }
+
+    def _fetch(_dyn: object, obj: dict, *, release_namespace: str) -> tuple:  # noqa: ARG001
+        live = copy.deepcopy(obj)
+        live["spec"]["replicas"] = 3
+        return live, None
+
+    monkeypatch.setattr("helmadm.drift.fetch_live_object", _fetch)
+
+    dyn = FakeDynamicClient()
+    report = run_drift(
+        dyn,
+        release,
+        release_namespace="monitoring",
+        release_name="prometheus",
+        detect_extras=False,
+    )
+    assert report.has_problem
+    dep = next(it for it in report.items if it.kind == "Deployment")
+    assert dep.severity == "drift"
+    assert "spec.replicas differs" in dep.detail
+    assert dep.diff and "replicas" in dep.diff
 
 
 def test_should_skip_helm_release_storage_secret_from_extras_scan() -> None:
