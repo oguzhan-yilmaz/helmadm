@@ -68,7 +68,7 @@ def test_verbose_flag_enables_debug_logging():
         patch("helmadm.cli.render_application", return_value=""),
     ):
         result = runner.invoke(
-            app, ["--verbose", "convert", "-n", "ns", "app"]
+            app, ["--verbose", "argocd-yaml", "-n", "ns", "app"]
         )
 
     assert result.exit_code == 0
@@ -83,7 +83,7 @@ def test_without_verbose_uses_warning_level():
         patch("helmadm.cli.get_release", return_value=_SAMPLE_RELEASE),
         patch("helmadm.cli.render_application", return_value=""),
     ):
-        result = runner.invoke(app, ["convert", "-n", "ns", "app"])
+        result = runner.invoke(app, ["argocd-yaml", "-n", "ns", "app"])
 
     assert result.exit_code == 0
     logger = logging.getLogger(PACKAGE_LOGGER)

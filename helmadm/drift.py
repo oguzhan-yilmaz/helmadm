@@ -721,8 +721,8 @@ def format_report_text(
     )
     if ignore_annotations:
         lines.append(
-            "# helmadm: Ignore annotations (--ignore-annotations / -ia): normalization rules "
-            "per drift item appear before each unified diff."
+            "# helmadm: --ignore-annotations / -ia: normalization rules per drift item "
+            "(see helmadm drift --help)."
         )
     lines.append(hr)
 

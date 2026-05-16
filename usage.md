@@ -33,27 +33,27 @@ uv run helmadm drift -n kube-system traefik  -h
 ```bash
 
 
-uv run helmadm convert --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter
+uv run helmadm argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter
 
-uv run helmadm convert -n keda --repo-url https://kedacore.github.io/charts keda
-uv run helmadm convert -n keda --repo-url https://kedacore.github.io/charts keda --verbose
-
-
-uv run helmadm --verbose convert -n keda --repo-url https://kedacore.github.io/charts --debug keda
+uv run helmadm argocd-yaml -n keda --repo-url https://kedacore.github.io/charts keda
+uv run helmadm argocd-yaml -n keda --repo-url https://kedacore.github.io/charts keda --verbose
 
 
-uv run helmadm --verbose convert -n keda --repo-url https://kedacore.github.io/charts --debug keda | code -
-uv run helmadm --verbose convert --repo-url https://kedacore.github.io/charts --debug -n monitoring prometheus | code -
-uv run helmadm --verbose convert --repo-url https://prometheus-community.github.io/helm-charts --debug -n monitoring prometheus | code -
-uv run helmadm --verbose convert --repo-url https://prometheus-community.github.io/helm-charts  -n monitoring prometheus | yq .
-uv run helmadm --verbose convert --repo-url https://prometheus-community.github.io/helm-charts  -n monitoring prometheus | code -
-time uv run helmadm convert --repo-url https://prometheus-community.github.io/helm-charts  -n monitoring prometheus
-uv run helmadm convert --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter
-uv run helmadm convert --repo-url https://prometheus-community.github.io/helm-charts -n monitoring prometheus
-uv run helmadm convert --repo-url https://traefik.github.io/charts -n kube-system traefik -v | yq .
-uv run helmadm convert --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter\n
+uv run helmadm --verbose argocd-yaml -n keda --repo-url https://kedacore.github.io/charts --debug keda
+
+
+uv run helmadm --verbose argocd-yaml -n keda --repo-url https://kedacore.github.io/charts --debug keda | code -
+uv run helmadm --verbose argocd-yaml --repo-url https://kedacore.github.io/charts --debug -n monitoring prometheus | code -
+uv run helmadm --verbose argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts --debug -n monitoring prometheus | code -
+uv run helmadm --verbose argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts  -n monitoring prometheus | yq .
+uv run helmadm --verbose argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts  -n monitoring prometheus | code -
+time uv run helmadm argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts  -n monitoring prometheus
+uv run helmadm argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter
+uv run helmadm argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts -n monitoring prometheus
+uv run helmadm argocd-yaml --repo-url https://traefik.github.io/charts -n kube-system traefik -v | yq .
+uv run helmadm argocd-yaml --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter\n
 uv run helmadm drift -n monitoring blackbox-exporter -ia -v | delta -s --paging never
-uv run helmadm convert -n monitoring      blackbox-exporter -v
+uv run helmadm argocd-yaml -n monitoring      blackbox-exporter -v
 
 
 ```

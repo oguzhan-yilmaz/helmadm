@@ -439,7 +439,7 @@ def test_format_report_text_optional_ignore_annotations_before_diff() -> None:
     assert "# helmadm:" not in plain
 
     ann = format_report_text(report, ignore_annotations=True)
-    assert "per drift item appear before each unified diff" in ann
+    assert "--ignore-annotations / -ia" in ann
     idx_header = ann.index("[drift]")
     idx_note = ann.index("# helmadm: Unified diff below")
     idx_diff = ann.index("--- a")
@@ -528,7 +528,7 @@ def test_cli_drift_ignore_annotations(
 
     assert result.exit_code == 1
     assert "# helmadm: Unified diff below" in result.stdout
-    assert "per drift item appear before each unified diff" in result.stdout
+    assert "--ignore-annotations / -ia" in result.stdout
 
 
 def test_cli_empty_manifest_reports_error(

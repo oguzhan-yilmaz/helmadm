@@ -1,8 +1,6 @@
 # helmadm
 
-Generate an Argo CD `Application` manifest from a Helm release stored in your cluster.
-
-Reads Helm release state from Kubernetes Secrets (no `helm` or `kubectl` CLI), diffs user values against chart defaults embedded in the release, and prints a manifest with overrides in `spec.source.helm.valuesObject`.
+CLI tools for Helm 3 releases stored in Kubernetes: generate Argo CD `Application` YAML, list releases, and compare a release manifest to live cluster objects. No `helm` or `kubectl` binary required.
 
 ## Requirements
 
@@ -16,28 +14,60 @@ Reads Helm release state from Kubernetes Secrets (no `helm` or `kubectl` CLI), d
 uv sync
 ```
 
-## Usage
+## Commands
+
+| Command | Purpose |
+|---------|---------|
+| `argocd-yaml` | Print an Argo CD `Application` manifest for a release (stdout) |
+| `ls` | List Helm releases in the cluster |
+| `drift` | Compare the release's stored manifest to live objects (read-only) |
 
 ```bash
 uv run helmadm --help
-uv run helmadm convert --help
+uv run helmadm argocd-yaml --help
 uv run helmadm ls --help
+uv run helmadm drift --help
 ```
 
-### Convert a release
+### `argocd-yaml` — Application manifest
+
+Reads the release from cluster storage, diffs coalesced chart values + user config against `helm show values` for the chart version (fetched from the chart repo), and writes overrides to `spec.source.helm.valuesObject`. Non-helm fields use `CHANGE_ME` placeholders.
 
 ```bash
-uv run helmadm convert -n monitoring prometheus
+uv run helmadm ls -n monitoring
+uv run helmadm argocd-yaml -n monitoring prometheus
 ```
 
-If the release does not store `chart.metadata.repoURL` (older installs or local charts), pass the repository URL:
+If the release has no `chart.metadata.repoURL`, pass the repository URL (see `NEEDS_REPO_URL` in `ls`):
 
 ```bash
-uv run helmadm convert -n monitoring prometheus \
+uv run helmadm argocd-yaml -n monitoring prometheus \
   --repo-url https://prometheus-community.github.io/helm-charts
 ```
 
-Tool-specific options can be set via environment variables (CLI flags take precedence):
+`--debug` adds a `.debug` block to the YAML (raw values, diff metadata, `ignoreAnnotations`). Remove it before applying to Argo CD.
+
+### `ls` — list releases
+
+```bash
+uv run helmadm ls                  # all namespaces, detailed (default)
+uv run helmadm ls -n monitoring    # one namespace
+uv run helmadm ls --no-detail      # name / revision / status only
+```
+
+### `drift` — manifest vs live
+
+```bash
+uv run helmadm drift -n monitoring prometheus
+uv run helmadm drift --detect-extras -n monitoring prometheus
+uv run helmadm drift -ia -n kube-system traefik   # print normalization notes before each diff
+```
+
+Exit `1` on drift, missing objects, fetch errors, or extras (with `--detect-extras`).
+
+### Environment variables
+
+CLI flags take precedence over env vars.
 
 | Flag | Environment variable |
 |------|----------------------|
@@ -45,24 +75,11 @@ Tool-specific options can be set via environment variables (CLI flags take prece
 | `--context` | `HELM_TO_ARGOCD_CONTEXT` |
 | `--repo-url` | `HELM_TO_ARGOCD_REPO_URL` |
 | release name (positional) | `HELM_TO_ARGOCD_RELEASE_NAME` |
-| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`; fails fast when the API is unreachable, e.g. VPN off) |
-| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_READ_TIMEOUT` — read timeout in seconds (default: `120`) |
+| (values trace, with `-v`) | `HELM_TO_ARGOCD_TRACE_VALUES` — per-key logs during `argocd-yaml` |
+| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`) |
+| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_READ_TIMEOUT` — read timeout in seconds (default: `60`) |
 
-`--kubeconfig` follows kubectl: set the path with the flag, or omit it and let the client use `KUBECONFIG` (colon-separated paths on Unix) or `~/.kube/config`.
-
-Without `-n`, the namespace is resolved in order: flag → `HELM_TO_ARGOCD_NAMESPACE` → default namespace on your current kubeconfig context.
-
-### List releases
-
-```bash
-uv run helmadm ls                  # all namespaces, detailed output (default)
-uv run helmadm ls -n monitoring    # one namespace
-uv run helmadm ls --no-detail      # revision/status only (faster)
-```
-
-By default, the table includes chart name/version, stored `repoURL`, and a `NEEDS_REPO_URL` column (`yes` means you must pass `--repo-url` when running `convert`).
-
-Output from `convert` is a single `Application` YAML on stdout. Non-helm fields (`metadata`, `project`, `destination`) use `CHANGE_ME` placeholders for you to fill in.
+`--kubeconfig` follows kubectl: use the flag, or `KUBECONFIG` / `~/.kube/config`.
 
 ## Development
 

@@ -21,6 +21,7 @@ from helmadm.env import (
     ENV_NAMESPACE,
     ENV_RELEASE_NAME,
     ENV_REPO_URL,
+    ENV_TRACE_VALUES,
     resolve_context,
     resolve_namespace,
     resolve_release_name,
@@ -52,7 +53,10 @@ logger = logging_config.get_logger("cli")
 
 app = typer.Typer(
     name="helmadm",
-    help="Generate Argo CD Application manifests from Helm releases in Kubernetes.",
+    help=(
+        "Work with Helm 3 releases stored in Kubernetes: build Argo CD Application YAML, "
+        "list releases, and compare a release manifest to live objects."
+    ),
     no_args_is_help=True,
     add_completion=False,
     rich_markup_mode="rich",
@@ -80,13 +84,24 @@ def main(
             "-v",
             "--verbose",
             help=(
-                "Enable debug logging on stderr. "
-                "Set HELM_TO_ARGOCD_TRACE_VALUES=1 for per-key values/diff logs."
+                "Debug logging on stderr for all subcommands. "
+                f"During argocd-yaml, set {ENV_TRACE_VALUES} for per-key "
+                "values/diff trace lines (requires --verbose)."
             ),
             rich_help_panel=PANEL_GLOBAL,
         ),
     ] = False,
 ) -> None:
+    """
+    Inspect Helm releases in the cluster without the helm or kubectl CLI.
+
+    \b
+    Commands:
+
+      [cyan]argocd-yaml[/cyan]  Build an Argo CD Application manifest from a release
+      [cyan]ls[/cyan]           List Helm releases (Helm 3 secret storage)
+      [cyan]drift[/cyan]        Compare the release's stored manifest to live objects (read-only)
+    """
     logging_config.setup_logging(verbose=verbose)
     logger.debug("logging configured (verbose=%s)", verbose)
 
@@ -116,7 +131,7 @@ class CliOptions:
 
 def run(options: CliOptions) -> int:
     logger.debug(
-        "convert: namespace=%r release=%r repo_url=%r context=%r kubeconfig=%s",
+        "argocd-yaml: namespace=%r release=%r repo_url=%r context=%r kubeconfig=%s",
         options.namespace,
         options.release_name,
         options.repo_url,
@@ -147,7 +162,7 @@ def run(options: CliOptions) -> int:
         typer.echo(str(exc), err=True)
         return 1
 
-    logger.debug("convert pipeline: release decoded and validated")
+    logger.debug("argocd-yaml pipeline: release decoded and validated")
 
     try:
         repo_url = resolve_repo_url(release, options.repo_url)
@@ -156,7 +171,7 @@ def run(options: CliOptions) -> int:
         typer.echo(str(exc), err=True)
         return 1
 
-    logger.debug("convert pipeline: repo URL resolved to %r", repo_url)
+    logger.debug("argocd-yaml pipeline: repo URL resolved to %r", repo_url)
 
     try:
         user_values, chart_values = extract_values_from_release(release)
@@ -176,7 +191,7 @@ def run(options: CliOptions) -> int:
         )
         return 1
 
-    logger.debug("convert pipeline: fetching remote chart defaults from %r", repo_url)
+    logger.debug("argocd-yaml pipeline: fetching remote chart defaults from %r", repo_url)
     try:
         remote_defaults = fetch_remote_chart_values(
             repo_url, chart_name, chart_version
@@ -187,13 +202,13 @@ def run(options: CliOptions) -> int:
         return 1
 
     logger.debug(
-        "convert pipeline: diffing cluster values against remote chart defaults"
+        "argocd-yaml pipeline: diffing cluster values against remote chart defaults"
     )
     values_object, values_strategy = resolve_values_object(
         cluster_values, remote_defaults
     )
     logger.debug(
-        "convert pipeline: valuesObject strategy=%r with %d top-level key(s)",
+        "argocd-yaml pipeline: valuesObject strategy=%r with %d top-level key(s)",
         values_strategy,
         len(values_object),
     )
@@ -209,7 +224,7 @@ def run(options: CliOptions) -> int:
             values_object,
             strategy=values_strategy,
         )
-        logger.debug("convert pipeline: built .debug manifest block")
+        logger.debug("argocd-yaml pipeline: built .debug manifest block")
 
     try:
         manifest = build_application(
@@ -220,9 +235,9 @@ def run(options: CliOptions) -> int:
         typer.echo(str(exc), err=True)
         return 1
 
-    logger.debug("convert pipeline: rendering Application manifest to YAML")
+    logger.debug("argocd-yaml pipeline: rendering Application manifest to YAML")
     rendered = render_application(manifest)
-    logger.debug("convert pipeline: rendered manifest (%d bytes)", len(rendered))
+    logger.debug("argocd-yaml pipeline: rendered manifest (%d bytes)", len(rendered))
     sys.stdout.write(rendered)
     return 0
 
@@ -345,10 +360,10 @@ def run_drift_command(
 
 
 @app.command(
-    "convert",
-    help="Generate an Argo CD Application manifest from a Helm release.",
+    "argocd-yaml",
+    help="Print an Argo CD Application manifest for a Helm release (stdout).",
 )
-def convert(
+def argocd_yaml(
     ctx: typer.Context,
     verbose: Annotated[
         bool,
@@ -356,8 +371,8 @@ def convert(
             "-v",
             "--verbose",
             help=(
-                "Enable debug logging on stderr. "
-                "Set HELM_TO_ARGOCD_TRACE_VALUES=1 for per-key values/diff logs."
+                "Debug logging on stderr. "
+                f"Set {ENV_TRACE_VALUES} for per-key values/diff trace during this command."
             ),
             rich_help_panel=PANEL_GLOBAL,
         ),
@@ -365,7 +380,7 @@ def convert(
     release_name: Annotated[
         str | None,
         typer.Argument(
-            help=f"Helm release name. [env: {ENV_RELEASE_NAME}]",
+            help=f"Helm release name (positional). [env: {ENV_RELEASE_NAME}]",
         ),
     ] = None,
     namespace: Annotated[
@@ -374,8 +389,8 @@ def convert(
             "-n",
             "--namespace",
             help=(
-                "Namespace where the Helm release is installed. "
-                f"Falls back to ${ENV_NAMESPACE} or the current kubeconfig context."
+                "Namespace of the Helm release. "
+                f"Default: ${ENV_NAMESPACE}, else the current kubeconfig context namespace."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
@@ -389,8 +404,8 @@ def convert(
             readable=True,
             resolve_path=True,
             help=(
-                "Kubeconfig file path. When omitted, uses "
-                f"${ENV_KUBECONFIG} or ~/.kube/config (same as kubectl)."
+                "Kubeconfig file. If omitted, uses "
+                f"${ENV_KUBECONFIG} or ~/.kube/config (kubectl behavior)."
             ),
             rich_help_panel=PANEL_KUBERNETES,
         ),
@@ -399,7 +414,7 @@ def convert(
         str | None,
         typer.Option(
             "--context",
-            help=f"Kubeconfig context to use. [env: {ENV_CONTEXT}]",
+            help=f"Kubeconfig context. [env: {ENV_CONTEXT}]",
             rich_help_panel=PANEL_KUBERNETES,
         ),
     ] = None,
@@ -408,7 +423,8 @@ def convert(
         typer.Option(
             "--repo-url",
             help=(
-                "Helm chart repository URL when chart.metadata.repoURL is missing. "
+                "Chart repository URL when the release has no chart.metadata.repoURL "
+                "(see NEEDS_REPO_URL in helmadm ls). "
                 f"[env: {ENV_REPO_URL}]"
             ),
             rich_help_panel=PANEL_CHART,
@@ -419,31 +435,36 @@ def convert(
         typer.Option(
             "--debug",
             help=(
-                "Include a .debug block in the manifest with cluster values "
-                "(release.config, chart.values) and diff diagnostics. "
-                "Also enables stderr debug logging."
+                "Add a .debug section to the YAML (cluster values, remote chart defaults, "
+                "diff strategy, ignoreAnnotations). Enables stderr debug logging. "
+                "Remove .debug before applying to Argo CD."
             ),
             rich_help_panel=PANEL_GLOBAL,
         ),
     ] = False,
 ) -> None:
     """
-    Read a Helm release from the cluster and print an Argo CD Application manifest.
+    Read a Helm 3 release from cluster storage and print one Argo CD [cyan]Application[/cyan] manifest.
 
-    Non-helm fields use [yellow]CHANGE_ME[/yellow] placeholders.
-    Overrides are written to [cyan]spec.source.helm.valuesObject[/cyan].
+    Values: coalesced [cyan]chart.values[/cyan] + [cyan]release.config[/cyan] from the release are
+    compared to [cyan]helm show values[/cyan] for the chart version (fetched from [cyan]--repo-url[/cyan]
+    or chart.metadata.repoURL). Only differences become [cyan]spec.source.helm.valuesObject[/cyan].
 
-    Use [cyan]--debug[/cyan] to embed [cyan].debug[/cyan] in the YAML with raw values
-    from the cluster and the diff result (remove before applying to Argo CD).
+    Argo CD fields you must set yourself ([cyan]metadata.name[/cyan], [cyan]project[/cyan],
+    [cyan]destination[/cyan], …) use [yellow]CHANGE_ME[/yellow] placeholders.
+
+    [cyan]--debug[/cyan] embeds a [cyan].debug[/cyan] block with the raw inputs and diff metadata
+    (including [cyan]ignoreAnnotations[/cyan] describing normalization). Strip it before commit/apply.
 
     \b
     Examples:
 
-      helmadm convert -n monitoring prometheus
-      helmadm convert -n monitoring prometheus > application.yaml
-      helmadm convert -n monitoring prometheus \\
+      helmadm ls -n monitoring
+      helmadm argocd-yaml -n monitoring prometheus
+      helmadm argocd-yaml -n monitoring prometheus > application.yaml
+      helmadm argocd-yaml -n monitoring prometheus \\
           --repo-url https://prometheus-community.github.io/helm-charts
-      helmadm --debug convert -n keda keda
+      helmadm argocd-yaml --debug -n keda keda
     """
     _apply_command_verbose(verbose)
     resolved_namespace = resolve_namespace(namespace, kubeconfig)
@@ -454,7 +475,7 @@ def convert(
         logging_config.setup_logging(verbose=True)
         logger.debug("stderr debug logging enabled via --debug")
     logger.debug(
-        "convert resolved: namespace=%r release=%r context=%r repo_url=%r debug=%s",
+        "argocd-yaml resolved: namespace=%r release=%r context=%r repo_url=%r debug=%s",
         resolved_namespace,
         resolved_release_name,
         resolved_context,
@@ -489,15 +510,12 @@ def convert(
         kubeconfig=kubeconfig,
         debug=debug,
     )
-    raise typer.Exit(run(options)    )
+    raise typer.Exit(run(options))
 
 
 @app.command(
     "drift",
-    help=(
-        "Compare the Helm release's stored rendered manifest against live cluster objects "
-        "(read-only)."
-    ),
+    help="Compare the release manifest to live objects (read-only; unified diffs on drift).",
 )
 def drift_command(
     ctx: typer.Context,
@@ -506,14 +524,14 @@ def drift_command(
         typer.Option(
             "-v",
             "--verbose",
-            help="Enable debug logging on stderr.",
+            help="Debug logging on stderr (API fetch paths, detect-extras scans).",
             rich_help_panel=PANEL_GLOBAL,
         ),
     ] = False,
     release_name: Annotated[
         str | None,
         typer.Argument(
-            help=f"Helm release name. [env: {ENV_RELEASE_NAME}]",
+            help=f"Helm release name (positional). [env: {ENV_RELEASE_NAME}]",
         ),
     ] = None,
     namespace: Annotated[
@@ -522,8 +540,8 @@ def drift_command(
             "-n",
             "--namespace",
             help=(
-                "Namespace where the Helm release is installed. "
-                f"Falls back to ${ENV_NAMESPACE} or the current kubeconfig context."
+                "Namespace of the Helm release. "
+                f"Default: ${ENV_NAMESPACE}, else the current kubeconfig context namespace."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
@@ -537,8 +555,8 @@ def drift_command(
             readable=True,
             resolve_path=True,
             help=(
-                "Kubeconfig file path. When omitted, uses "
-                f"${ENV_KUBECONFIG} or ~/.kube/config (same as kubectl)."
+                "Kubeconfig file. If omitted, uses "
+                f"${ENV_KUBECONFIG} or ~/.kube/config (kubectl behavior)."
             ),
             rich_help_panel=PANEL_KUBERNETES,
         ),
@@ -547,7 +565,7 @@ def drift_command(
         str | None,
         typer.Option(
             "--context",
-            help=f"Kubeconfig context to use. [env: {ENV_CONTEXT}]",
+            help=f"Kubeconfig context. [env: {ENV_CONTEXT}]",
             rich_help_panel=PANEL_KUBERNETES,
         ),
     ] = None,
@@ -556,9 +574,9 @@ def drift_command(
         typer.Option(
             "--detect-extras",
             help=(
-                "List every namespaced resource kind in the release namespace and report "
-                "objects missing from the Helm manifest (includes resources without Helm labels; "
-                "needs broad list RBAC)."
+                "LIST every namespaced API kind in -n and flag objects not in the release "
+                "manifest (includes unlabeled resources; needs broad list RBAC). "
+                "Helm release storage secrets (helm.sh/release.v1) are skipped."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
@@ -569,36 +587,41 @@ def drift_command(
             "--ignore-annotations",
             "-ia",
             help=(
-                "Prefix each unified diff with # helmadm lines describing fields stripped "
-                "for compare (metadata noise, Service runtime fields, Pod defaults, …)."
+                "Before each unified diff, print # helmadm lines listing normalization rules "
+                "(metadata noise, Helm/kubectl annotations, Service clusterIP/nodePort, "
+                "Pod template defaults, …)."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
     ] = False,
 ) -> None:
     """
-    Read the Helm 3 manifest stored with the release, fetch matching live objects, and print a diff summary.
+    Compare each object in the Helm release [cyan]manifest[/cyan] to the live API object (read-only).
 
-    This command does **not** change the cluster. Hook resources stay out of manifest and are omitted (Helm hooks are stored separately from `manifest`).
-    Comparisons omit `metadata` fields populated by Kubernetes (uids, timestamps, ...) and omit `status`, so false positives remain possible—e.g. list ordering differences on `containers[*].env`, or Secrets `data` vs `stringData`.
+    Does **not** run helm upgrade or kubectl apply. Helm hook manifests are not in [cyan]manifest[/cyan]
+    and are not checked.
 
-    Helm injects ``meta.helm.sh/release-name`` and ``meta.helm.sh/release-namespace`` at install time; drift ignores those annotations when diffing against ``manifest``. Similarly ignored: ``kubectl.kubernetes.io/restartedAt``; label ``app.kubernetes.io/managed-by: Helm``; on ``Service`` objects, apiserver-filled ``clusterIP`` / ``clusterIPs``, ``ipFamilies``, ``ipFamilyPolicy``, ``internalTrafficPolicy``, per-port ``nodePort`` on the **live** side only (manifest ``nodePort`` is kept so pinned chart ports still compare), and ``sessionAffinity`` when unset or the API default ``None`` / ``"None"``.
+    Before compare, both sides are normalized (drop [cyan]status[/cyan], server metadata, Helm/kubectl
+    install-time annotations, common Service and Pod defaults, etc.). Drifting objects get a unified
+    diff ([cyan]manifest/...[/cyan] vs [cyan]live/...[/cyan]). False positives are still possible
+    (e.g. env list order, Secret [cyan]data[/cyan] vs [cyan]stringData[/cyan]).
 
-    All ``metadata.namespace`` fields are ignored when comparing (templates often omit namespace). ``metadata.annotations`` / ``labels`` set to YAML ``null`` are treated like omitted keys.
+    Use [cyan]--ignore-annotations[/cyan] / [cyan]-ia[/cyan] to print the full normalization checklist
+    above each diff. Without it, only the diff is shown.
 
-    For ``Deployment`` (and other objects with embedded Pod templates: DaemonSet, StatefulSet, ReplicaSet, Job, CronJob, Pod), drift ignores ``deployment.kubernetes.io/revision`` on Deployments, default ``progressDeadlineSeconds`` (600), and common defaulted Pod / container fields such as ``schedulerName``, ``hostNetwork``, ``dnsPolicy``, ``terminationGracePeriodSeconds``, ``restartPolicy`` when ``Always``, ``terminationMessagePath``, ``terminationMessagePolicy``, empty ``securityContext`` and ``resources`` objects on containers, and redundant ``serviceAccount`` when ``serviceAccountName`` is present.
+    [cyan]--detect-extras[/cyan] reports namespaced objects in [cyan]-n[/cyan] that are absent from
+    the manifest (manual installs, other controllers).
 
-    Exit code ``1`` if any drift, missing manifest object, extras (with ``--detect-extras``), or fetch error occurs; ``0`` when everything matches.
-
-    With ``--detect-extras``, every namespaced API resource type is listed in ``-n``; objects not named in the Helm ``manifest`` are reported (including manually applied resources without Helm labels). Helm release storage Secrets (type ``helm.sh/release.v1``) are omitted from that scan.
+    Exit [cyan]0[/cyan] when every manifest object matches; [cyan]1[/cyan] on drift, missing object,
+    fetch error, or any extra (with [cyan]--detect-extras[/cyan]).
 
     \b
     Examples:
 
       helmadm drift -n monitoring prometheus
+      helmadm drift -n monitoring prometheus | delta -s
       helmadm drift --detect-extras -n monitoring prometheus
-      helmadm drift --ignore-annotations -n monitoring prometheus
-      helmadm drift -ia -n monitoring prometheus
+      helmadm drift -ia -n kube-system traefik
     """
     _apply_command_verbose(verbose)
     resolved_namespace = resolve_namespace(namespace, kubeconfig)
@@ -645,7 +668,7 @@ def drift_command(
 
 @app.command(
     "ls",
-    help="List Helm releases stored in the cluster.",
+    help="List Helm 3 releases from cluster secret storage.",
 )
 def ls(
     ctx: typer.Context,
@@ -654,10 +677,7 @@ def ls(
         typer.Option(
             "-v",
             "--verbose",
-            help=(
-                "Enable debug logging on stderr. "
-                "Set HELM_TO_ARGOCD_TRACE_VALUES=1 for per-key values/diff logs."
-            ),
+            help="Debug logging on stderr.",
             rich_help_panel=PANEL_GLOBAL,
         ),
     ] = False,
@@ -666,7 +686,7 @@ def ls(
         typer.Option(
             "-n",
             "--namespace",
-            help="Namespace to list. Omit to list all namespaces (default).",
+            help="Limit to one namespace. If omitted, lists all namespaces.",
             rich_help_panel=PANEL_RELEASE,
         ),
     ] = None,
@@ -675,7 +695,7 @@ def ls(
         typer.Option(
             "-A",
             "--all-namespaces",
-            help="List releases in all namespaces (default when -n is omitted).",
+            help="Same as omitting -n: list releases in every namespace.",
             rich_help_panel=PANEL_RELEASE,
         ),
     ] = False,
@@ -684,8 +704,8 @@ def ls(
         typer.Option(
             "--detail/--no-detail",
             help=(
-                "Show chart name, version, repo URL, and whether --repo-url is "
-                "required for convert. [default: detail on]"
+                "With detail (default): chart, version, stored repoURL, and NEEDS_REPO_URL "
+                "(yes = pass --repo-url to argocd-yaml). Without: name/revision/status only."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
@@ -699,8 +719,8 @@ def ls(
             readable=True,
             resolve_path=True,
             help=(
-                "Kubeconfig file path. When omitted, uses "
-                f"${ENV_KUBECONFIG} or ~/.kube/config (same as kubectl)."
+                "Kubeconfig file. If omitted, uses "
+                f"${ENV_KUBECONFIG} or ~/.kube/config (kubectl behavior)."
             ),
             rich_help_panel=PANEL_KUBERNETES,
         ),
@@ -709,13 +729,17 @@ def ls(
         str | None,
         typer.Option(
             "--context",
-            help=f"Kubeconfig context to use. [env: {ENV_CONTEXT}]",
+            help=f"Kubeconfig context. [env: {ENV_CONTEXT}]",
             rich_help_panel=PANEL_KUBERNETES,
         ),
     ] = None,
 ) -> None:
     """
-    List Helm releases from Kubernetes secrets (Helm 3 storage driver).
+    Tabular list of Helm releases decoded from Kubernetes (Helm 3 secret driver).
+
+    Default: all namespaces, detailed columns. Use [cyan]-n[/cyan] for one namespace.
+    [cyan]NEEDS_REPO_URL=yes[/cyan] means [cyan]argocd-yaml[/cyan] needs [cyan]--repo-url[/cyan]
+    because the release lacks [cyan]chart.metadata.repoURL[/cyan].
 
     \b
     Examples:

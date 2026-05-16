@@ -18,7 +18,7 @@ runner = CliRunner()
 def test_root_help_lists_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "convert" in result.stdout
+    assert "argocd-yaml" in result.stdout
     assert "ls" in result.stdout
     assert "drift" in result.stdout
     assert "--verbose" in result.stdout
@@ -29,21 +29,21 @@ def test_no_args_shows_root_help(clean_env):
     # Click exits 2 when no subcommand is given (same as --help-style usage output).
     assert result.exit_code in (0, 2)
     assert "Usage:" in result.stdout
-    assert "convert" in result.stdout
+    assert "argocd-yaml" in result.stdout
     assert "ls" in result.stdout
     assert "drift" in result.stdout
 
 
-def test_convert_help_shows_examples():
-    result = runner.invoke(app, ["convert", "--help"])
+def test_argocd_yaml_help_shows_examples():
+    result = runner.invoke(app, ["argocd-yaml", "--help"])
     assert result.exit_code == 0
-    assert "helmadm convert" in result.stdout
+    assert "helmadm argocd-yaml" in result.stdout
     assert "RELEASE_NAME" in result.stdout or "release" in result.stdout.lower()
     assert "--debug" in result.stdout
     assert "--verbose" in result.stdout or "-v" in result.stdout
 
 
-def test_convert_accepts_verbose_after_arguments(clean_env, monkeypatch):
+def test_argocd_yaml_accepts_verbose_after_arguments(clean_env, monkeypatch):
     import logging
 
     from helmadm.logging_config import PACKAGE_LOGGER
@@ -71,7 +71,7 @@ def test_convert_accepts_verbose_after_arguments(clean_env, monkeypatch):
         result = runner.invoke(
             app,
             [
-                "convert",
+                "argocd-yaml",
                 "--repo-url",
                 "https://traefik.github.io/charts",
                 "-n",
@@ -85,7 +85,7 @@ def test_convert_accepts_verbose_after_arguments(clean_env, monkeypatch):
     assert logging.getLogger(PACKAGE_LOGGER).level == logging.DEBUG
 
 
-def test_convert_debug_includes_debug_block(clean_env, monkeypatch):
+def test_argocd_yaml_debug_includes_debug_block(clean_env, monkeypatch):
     release = {
         "name": "app",
         "config": {"foo": "bar"},
@@ -107,7 +107,7 @@ def test_convert_debug_includes_debug_block(clean_env, monkeypatch):
             return_value={"foo": "default"},
         ),
     ):
-        result = runner.invoke(app, ["convert", "--debug", "-n", "ns", "app"])
+        result = runner.invoke(app, ["argocd-yaml", "--debug", "-n", "ns", "app"])
 
     assert result.exit_code == 0
     assert ".debug:" in result.stdout
@@ -117,10 +117,10 @@ def test_convert_debug_includes_debug_block(clean_env, monkeypatch):
     assert "chartValues:" in result.stdout
 
 
-def test_convert_no_args_shows_help(clean_env):
-    result = runner.invoke(app, ["convert"])
+def test_argocd_yaml_no_args_shows_help(clean_env):
+    result = runner.invoke(app, ["argocd-yaml"])
     assert result.exit_code == 0
-    assert "convert" in result.stdout.lower()
+    assert "argocd-yaml" in result.stdout.lower()
     assert "Error:" not in result.stderr
 
 
@@ -152,7 +152,7 @@ def test_parse_from_environment(clean_env, monkeypatch):
                 "values": {},
             },
         }
-        result = runner.invoke(app, ["convert", "prometheus"])
+        result = runner.invoke(app, ["argocd-yaml", "prometheus"])
 
     assert result.exit_code == 0
 
@@ -181,7 +181,7 @@ def test_kubeconfig_not_set_from_kubeconfig_env(clean_env, monkeypatch, tmp_path
                 "values": {},
             },
         }
-        result = runner.invoke(app, ["convert", "app"])
+        result = runner.invoke(app, ["argocd-yaml", "app"])
 
     assert result.exit_code == 0
     load_client.assert_called_once_with()
@@ -211,7 +211,7 @@ def test_explicit_kubeconfig_flag(clean_env, monkeypatch, tmp_path):
             },
         }
         result = runner.invoke(
-            app, ["convert", "--kubeconfig", str(kubeconfig), "app"]
+            app, ["argocd-yaml", "--kubeconfig", str(kubeconfig), "app"]
         )
 
     assert result.exit_code == 0
@@ -252,7 +252,7 @@ def test_cli_overrides_environment(clean_env, monkeypatch):
             },
         }
         result = runner.invoke(
-            app, ["convert", "-n", "from-cli", "from-cli-release"]
+            app, ["argocd-yaml", "-n", "from-cli", "from-cli-release"]
         )
 
     assert result.exit_code == 0
@@ -265,14 +265,14 @@ def test_missing_namespace_exits_with_error(clean_env, monkeypatch):
         "helmadm.cli.resolve_namespace",
         lambda *_args, **_kwargs: None,
     )
-    result = runner.invoke(app, ["convert", "prometheus"])
+    result = runner.invoke(app, ["argocd-yaml", "prometheus"])
     assert result.exit_code == 2
     assert ENV_NAMESPACE in result.stderr
 
 
 def test_missing_release_name_exits_with_error(clean_env, monkeypatch):
     monkeypatch.setenv(ENV_NAMESPACE, "monitoring")
-    result = runner.invoke(app, ["convert", "-n", "monitoring"])
+    result = runner.invoke(app, ["argocd-yaml", "-n", "monitoring"])
     assert result.exit_code == 2
     assert ENV_RELEASE_NAME in result.stderr
 
@@ -402,7 +402,7 @@ def test_ls_all_namespaces(clean_env):
 
 
 @pytest.mark.no_stub_k8s_access
-def test_convert_errors_when_kubernetes_unreachable(clean_env, monkeypatch):
+def test_argocd_yaml_errors_when_kubernetes_unreachable(clean_env, monkeypatch):
     monkeypatch.setenv(ENV_NAMESPACE, "ns")
     monkeypatch.setenv(ENV_RELEASE_NAME, "app")
 
@@ -412,7 +412,7 @@ def test_convert_errors_when_kubernetes_unreachable(clean_env, monkeypatch):
     monkeypatch.setattr("helmadm.cli.check_kubernetes_accessible", fail_access)
 
     with patch("helmadm.cli.load_kubernetes_client"):
-        result = runner.invoke(app, ["convert", "app"])
+        result = runner.invoke(app, ["argocd-yaml", "app"])
 
     assert result.exit_code == 1
     assert "Error:" in result.stderr
