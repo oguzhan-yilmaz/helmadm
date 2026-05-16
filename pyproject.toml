@@ -20,6 +20,20 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["helmadm"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.ai",
+    "/.venv",
+    "/.vscode",
+    "/bundles",
+    "docs/develop",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.mypy_cache",
+    "/dist",
+    "/build",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0",

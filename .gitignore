@@ -1,6 +1,30 @@
+# Local / IDE
 .ai
 .venv
-*.pyc
 .vscode/
-bundles/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test & tool caches
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# helmadm pull output (local bundles, not for PyPI)
+bundles/
+
+# uv build & publish (do not commit artifacts)
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg
+*.whl
+
+# PyPI / publish credentials (never commit)
+.pypirc
