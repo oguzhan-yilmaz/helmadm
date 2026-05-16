@@ -4,6 +4,9 @@
 ```bash
 uv run helmadm ls
 
+uv run helmadm pull -n loki -o ./bundles fluentbit
+uv run helmadm pull -n monitoring prometheus --revision 3 -o ./bundles
+
 ```
 
 
@@ -56,4 +59,18 @@ uv run helmadm drift -n monitoring blackbox-exporter -ia -v | delta -s --paging 
 uv run helmadm argocd-yaml -n monitoring      blackbox-exporter -v
 
 
+
+
+uv run helmadm pull -o ./bundles --repo-url https://prometheus-community.github.io/helm-charts -n monitoring blackbox-exporter
 ```
+
+
+change file names to -> used.values.yaml ,
+
+
+
+*.all.values.yaml       -> *.all.values.yaml
+*.values.yaml           -> *.changed.values.yaml
+README.md               -> 
+release.yaml            -> put this inside readme, dont want it here
+remote.values.yaml      -> *.remote-all.values.yaml 

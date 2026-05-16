@@ -10,6 +10,33 @@ from helmadm.env import ENV_NAMESPACE, ENV_RELEASE_NAME, ENV_TRACE_VALUES
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+def make_load_release_and_values_result(
+    release: dict,
+    *,
+    remote_defaults: dict | None = None,
+    repo_url: str | None = None,
+    helm_revision: int = 1,
+    status: str = "deployed",
+) -> tuple:
+    from helmadm.argocd_manifest import resolve_repo_url
+    from helmadm.values_diff import cluster_values_from_release, resolve_values_object
+
+    cluster = cluster_values_from_release(release)
+    remote = remote_defaults if remote_defaults is not None else {}
+    values_object, strategy = resolve_values_object(cluster, remote)
+    resolved_repo = repo_url or resolve_repo_url(release, None)
+    return (
+        release,
+        resolved_repo,
+        cluster,
+        remote,
+        values_object,
+        strategy,
+        helm_revision,
+        status,
+    )
+
+
 @pytest.fixture(autouse=True)
 def mock_remote_chart_values_for_cli(monkeypatch, request):
     """Avoid network during CLI tests; individual tests may override."""
@@ -26,7 +53,7 @@ def mock_remote_chart_values_for_cli(monkeypatch, request):
 def stub_cli_kubernetes_access_check(request, monkeypatch):
     """CLI tests mock the client; avoid calling a real API server for connectivity."""
     mod = request.module.__name__
-    if mod not in ("tests.test_cli", "tests.test_logging"):
+    if mod not in ("tests.test_cli", "tests.test_logging", "tests.test_pull"):
         return
     if request.node.get_closest_marker("no_stub_k8s_access"):
         return
