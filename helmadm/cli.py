@@ -780,7 +780,12 @@ def drift_command(
     ] = False,
 ) -> None:
     """
-    Compare each object in the Helm release [cyan]manifest[/cyan] to the live API object (read-only).
+    Compare each object in the Helm release [cyan]manifest[/cyan] (from the latest revision secret)
+    to a fresh live API [cyan]GET[/cyan] — there is no cache between runs.
+
+    [cyan]kubectl scale[/cyan] / replica edits on [cyan]Deployment[/cyan], [cyan]StatefulSet[/cyan], or
+    [cyan]ReplicaSet[/cyan] objects in the manifest should appear as drift unless a controller
+    (e.g. HPA, GitOps) reconciles them back before you run this command.
 
     Does **not** run helm upgrade or kubectl apply. Helm hook manifests are not in [cyan]manifest[/cyan]
     and are not checked.
