@@ -279,6 +279,7 @@ def run_drift_command(
     kubeconfig: Path | None,
     context: str | None,
     detect_extras: bool,
+    ignore_annotations: bool = False,
 ) -> int:
     client_kwargs = _kubernetes_client_kwargs(
         kubeconfig=kubeconfig,
@@ -337,7 +338,9 @@ def run_drift_command(
         release_name=release_name,
         detect_extras=detect_extras,
     )
-    typer.echo(format_report_text(report))
+    typer.echo(
+        format_report_text(report, ignore_annotations=ignore_annotations)
+    )
     return 1 if report.has_problem else 0
 
 
@@ -560,6 +563,18 @@ def drift_command(
             rich_help_panel=PANEL_RELEASE,
         ),
     ] = False,
+    ignore_annotations: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-annotations",
+            "-ia",
+            help=(
+                "Prefix each unified diff with # helmadm lines describing fields stripped "
+                "for compare (metadata noise, Service runtime fields, Pod defaults, …)."
+            ),
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = False,
 ) -> None:
     """
     Read the Helm 3 manifest stored with the release, fetch matching live objects, and print a diff summary.
@@ -582,6 +597,8 @@ def drift_command(
 
       helmadm drift -n monitoring prometheus
       helmadm drift --detect-extras -n monitoring prometheus
+      helmadm drift --ignore-annotations -n monitoring prometheus
+      helmadm drift -ia -n monitoring prometheus
     """
     _apply_command_verbose(verbose)
     resolved_namespace = resolve_namespace(namespace, kubeconfig)
@@ -621,6 +638,7 @@ def drift_command(
             kubeconfig=kubeconfig,
             context=resolved_context,
             detect_extras=detect_extras,
+            ignore_annotations=ignore_annotations,
         )
     )
 

@@ -7,6 +7,15 @@ logger = get_logger("values_diff")
 
 ValuesStrategy = Literal["remote.diff", "empty"]
 
+VALUES_DIFF_IGNORE_ANNOTATIONS: tuple[str, ...] = (
+    "valuesObject is cluster chart.values+config coalesced, diffed against helm show values "
+    "(remote chart defaults).",
+    "YAML null, empty string, empty list, and empty dict are treated as equal to a missing key "
+    "(Helm omit vs explicit empty).",
+    "Keys and nested branches equal after that normalization are omitted; unchanged subtrees "
+    "are pruned from the diff.",
+)
+
 
 def _is_emptyish(value: Any) -> bool:
     """Values often omitted from values.yaml but present as empty in merged cluster state."""
@@ -248,5 +257,6 @@ def build_values_debug(
             "topLevelKeys": _top_level_key_sets(
                 cluster_values, remote_defaults, values_object
             ),
+            "ignoreAnnotations": list(VALUES_DIFF_IGNORE_ANNOTATIONS),
         },
     }

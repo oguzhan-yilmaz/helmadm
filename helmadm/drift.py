@@ -111,6 +111,49 @@ _KUBECTL_RUNTIME_ANNOTATION_KEYS = frozenset(
 
 _HELM_MANAGED_BY_LABEL_KEY = "app.kubernetes.io/managed-by"
 
+_WORKLOAD_POD_TEMPLATE_KINDS = frozenset(
+    {
+        "CronJob",
+        "DaemonSet",
+        "Deployment",
+        "Job",
+        "Pod",
+        "ReplicaSet",
+        "StatefulSet",
+    }
+)
+
+
+def drift_ignore_annotation_lines(kind: str) -> list[str]:
+    """Human-readable ``# helmadm:`` lines documenting normalization before drift unified diffs."""
+    meta_noise = ", ".join(sorted(_METADATA_NOISE_KEYS))
+    helm_ann = ", ".join(sorted(_HELM_INSTALL_ONLY_ANNOTATION_KEYS))
+    kubectl_ann = ", ".join(sorted(_KUBECTL_RUNTIME_ANNOTATION_KEYS))
+    lines: list[str] = [
+        "# helmadm: Unified diff below uses YAML after normalization.",
+        f"# helmadm: Removed everywhere: status; metadata.namespace; metadata ({meta_noise}).",
+        f"# helmadm: Removed annotations: {helm_ann}; {kubectl_ann}.",
+        "# helmadm: Removed label app.kubernetes.io/managed-by when value is Helm "
+        "(chart manifests often omit it).",
+    ]
+    if kind == "Service":
+        lines.append(
+            "# helmadm: Service spec: strip clusterIP, clusterIPs, ipFamilies, ipFamilyPolicy, "
+            "internalTrafficPolicy; sessionAffinity when unset/None; nodePort on live ports only."
+        )
+    if kind == "Deployment":
+        lines.append(
+            "# helmadm: Deployment: strip deployment.kubernetes.io/revision; "
+            "spec.progressDeadlineSeconds when 600."
+        )
+    if kind in _WORKLOAD_POD_TEMPLATE_KINDS:
+        lines.append(
+            "# helmadm: Pod / embedded Pod spec: strip common API defaults (schedulerName, "
+            "dnsPolicy, hostNetwork, ...), empty securityContext/resources, redundant "
+            "serviceAccount when serviceAccountName is set."
+        )
+    return lines
+
 
 def _strip_drifting_annotations(md: dict[str, Any]) -> None:
     """Remove annotations Helm/kubectl add after rendering."""
@@ -664,7 +707,11 @@ def run_drift(
     return report
 
 
-def format_report_text(report: DriftReport) -> str:
+def format_report_text(
+    report: DriftReport,
+    *,
+    ignore_annotations: bool = False,
+) -> str:
     lines: list[str] = []
     hr = "=" * 64
     lines.append(hr)
@@ -672,6 +719,11 @@ def format_report_text(report: DriftReport) -> str:
         f"Helm drift: release {report.release_name!r} "
         f"namespace {report.namespace!r} (manifest vs live; read-only)"
     )
+    if ignore_annotations:
+        lines.append(
+            "# helmadm: Ignore annotations (--ignore-annotations / -ia): normalization rules "
+            "per drift item appear before each unified diff."
+        )
     lines.append(hr)
 
     severity_order = {"fetch_error": 0, "missing": 1, "drift": 2, "ok": 3}
@@ -689,6 +741,9 @@ def format_report_text(report: DriftReport) -> str:
         if item.detail.strip():
             lines.append(f"    {item.detail}")
         if item.diff and item.severity == "drift":
+            if ignore_annotations:
+                for note in drift_ignore_annotation_lines(item.kind):
+                    lines.append(note)
             for diff_line in item.diff.rstrip().splitlines():
                 lines.append(diff_line.rstrip())
 

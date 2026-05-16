@@ -12,6 +12,7 @@ from helmadm.argocd_manifest import (
     resolve_repo_url,
 )
 from helmadm.values_diff import (
+    VALUES_DIFF_IGNORE_ANNOTATIONS,
     build_values_debug,
     cluster_values_from_release,
     resolve_values_object,
@@ -119,6 +120,9 @@ def test_build_application_with_debug_block(sample_release):
     ]
     assert manifest[DEBUG_FIELD]["remoteDefaults"] == remote
     assert manifest[DEBUG_FIELD]["diff"]["valuesObject"] == values_object
+    assert manifest[DEBUG_FIELD]["diff"]["ignoreAnnotations"] == list(
+        VALUES_DIFF_IGNORE_ANNOTATIONS
+    )
 
 
 def test_render_application_includes_debug_yaml(sample_release):

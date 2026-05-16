@@ -14,6 +14,7 @@ from helmadm.drift import (
     ManifestObjectResult,
     _should_skip_extras_list_item,
     _unified_yaml_diff,
+    drift_ignore_annotation_lines,
     format_report_text,
     normalize_for_compare,
     parse_release_manifest,
@@ -409,6 +410,42 @@ def test_run_drift_extras_flag(monkeypatch: pytest.MonkeyPatch, sample_release: 
     assert ("v1", "Pod", "monitoring", "orphan-pod") in report.extras
 
 
+def test_drift_ignore_annotation_lines_service_includes_service_rules() -> None:
+    svc_notes = drift_ignore_annotation_lines("Service")
+    assert any("Service spec:" in line for line in svc_notes)
+    assert any("clusterIP" in line for line in svc_notes)
+
+    cm_notes = drift_ignore_annotation_lines("ConfigMap")
+    assert not any("Service spec:" in line for line in cm_notes)
+
+
+def test_format_report_text_optional_ignore_annotations_before_diff() -> None:
+    report = DriftReport(
+        release_name="r",
+        namespace="ns",
+        items=[
+            ManifestObjectResult(
+                api_version="v1",
+                kind="ConfigMap",
+                namespace="ns",
+                name="x",
+                severity="drift",
+                detail="differs",
+                diff="--- a\n+++ b\n",
+            )
+        ],
+    )
+    plain = format_report_text(report)
+    assert "# helmadm:" not in plain
+
+    ann = format_report_text(report, ignore_annotations=True)
+    assert "per drift item appear before each unified diff" in ann
+    idx_header = ann.index("[drift]")
+    idx_note = ann.index("# helmadm: Unified diff below")
+    idx_diff = ann.index("--- a")
+    assert idx_header < idx_note < idx_diff
+
+
 def test_format_report_text_contains_result() -> None:
     report = DriftReport(
         release_name="r",
@@ -432,6 +469,8 @@ def test_cli_drift_help() -> None:
     result = runner.invoke(app, ["drift", "--help"])
     assert result.exit_code == 0
     assert "manifest" in result.stdout.lower()
+    assert "--ignore-annotations" in result.stdout
+    assert "-ia" in result.stdout
 
 
 def test_cli_drift_sync_exit_zero(
@@ -454,6 +493,42 @@ def test_cli_drift_sync_exit_zero(
 
     assert result.exit_code == 0
     assert "[ok]" in result.stdout
+
+
+def test_cli_drift_ignore_annotations(
+    monkeypatch: pytest.MonkeyPatch, sample_release: dict, clean_env
+) -> None:
+    monkeypatch.setenv(ENV_NAMESPACE, "monitoring")
+    monkeypatch.delenv(ENV_RELEASE_NAME, raising=False)
+
+    def _fetch(_dyn, obj, *, release_namespace):  # noqa: ANN001
+        live = copy.deepcopy(obj)
+        if live.get("kind") == "ConfigMap" and isinstance(live.get("data"), dict):
+            live["data"]["patched"] = "1"
+        return live, None
+
+    monkeypatch.setattr("helmadm.drift.fetch_live_object", _fetch)
+
+    with (
+        patch("helmadm.cli.load_kubernetes_client"),
+        patch("helmadm.cli.check_kubernetes_accessible"),
+        patch("helmadm.cli.get_release", return_value=sample_release),
+        patch("helmadm.cli.load_dynamic_client", return_value=FakeDynamicClient()),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "drift",
+                "-ia",
+                "-n",
+                "monitoring",
+                "prometheus",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "# helmadm: Unified diff below" in result.stdout
+    assert "per drift item appear before each unified diff" in result.stdout
 
 
 def test_cli_empty_manifest_reports_error(

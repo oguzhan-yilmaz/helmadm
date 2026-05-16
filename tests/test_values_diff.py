@@ -1,6 +1,7 @@
 import pytest
 
 from helmadm.values_diff import (
+    VALUES_DIFF_IGNORE_ANNOTATIONS,
     build_values_debug,
     cluster_values_from_release,
     coalesce_values,
@@ -163,4 +164,5 @@ def test_build_values_debug_includes_cluster_values(sample_release):
     assert debug["valuesFromCluster"]["coalesced"] == cluster
     assert debug["remoteDefaults"] == remote
     assert debug["diff"]["valuesObject"] == values_object
+    assert debug["diff"]["ignoreAnnotations"] == list(VALUES_DIFF_IGNORE_ANNOTATIONS)
     assert "server" in debug["diff"]["topLevelKeys"]["inValuesObject"]
