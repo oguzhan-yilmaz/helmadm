@@ -1,6 +1,6 @@
 [project]
 name = "helmadm"
-version = "0.1.1"
+version = "0.1.2"
 description = "Generate Argo CD Application manifests from Helm releases in Kubernetes"
 readme = "README.md"
 requires-python = ">=3.12"
