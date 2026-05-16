@@ -50,7 +50,7 @@ def get_logger(name: str) -> logging.Logger:
 
 
 def trace_values(logger: logging.Logger, msg: str, *args: Any) -> None:
-    """Emit values/diff debug lines only when HELM_TO_ARGOCD_TRACE_VALUES is set."""
+    """Emit values/diff debug lines only when HELMADM_TRACE_VALUES is set."""
     from helmadm.env import trace_values_enabled
 
     if trace_values_enabled():

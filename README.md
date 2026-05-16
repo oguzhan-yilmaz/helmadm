@@ -102,13 +102,13 @@ CLI flags take precedence over env vars.
 
 | Flag | Environment variable |
 |------|----------------------|
-| `-n` / `--namespace` | `HELM_TO_ARGOCD_NAMESPACE` (or current kubeconfig context namespace) |
-| `--context` | `HELM_TO_ARGOCD_CONTEXT` |
-| `--repo-url` | `HELM_TO_ARGOCD_REPO_URL` |
-| release name (positional) | `HELM_TO_ARGOCD_RELEASE_NAME` |
-| (values trace, with `-v`) | `HELM_TO_ARGOCD_TRACE_VALUES` — per-key logs during `argocd-yaml` |
-| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`) |
-| (Kubernetes HTTP) | `HELM_TO_ARGOCD_K8S_READ_TIMEOUT` — read timeout in seconds (default: `60`) |
+| `-n` / `--namespace` | `HELMADM_NAMESPACE` (or current kubeconfig context namespace) |
+| `--context` | `HELMADM_CONTEXT` |
+| `--repo-url` | `HELMADM_REPO_URL` |
+| release name (positional) | `HELMADM_RELEASE_NAME` |
+| (values trace, with `-v`) | `HELMADM_TRACE_VALUES` — per-key logs during `argocd-yaml` |
+| (Kubernetes HTTP) | `HELMADM_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`) |
+| (Kubernetes HTTP) | `HELMADM_K8S_READ_TIMEOUT` — read timeout in seconds (default: `60`) |
 
 `--kubeconfig` follows kubectl: use the flag, or `KUBECONFIG` / `~/.kube/config`.
 

@@ -5,7 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from helmadm.env import ENV_NAMESPACE, ENV_RELEASE_NAME, ENV_TRACE_VALUES
+from helmadm.env import (
+    ENV_CONTEXT,
+    ENV_K8S_CONNECT_TIMEOUT,
+    ENV_K8S_READ_TIMEOUT,
+    ENV_NAMESPACE,
+    ENV_RELEASE_NAME,
+    ENV_REPO_URL,
+    ENV_TRACE_VALUES,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -68,12 +76,12 @@ def clean_env(monkeypatch):
     for key in (
         ENV_NAMESPACE,
         "KUBECONFIG",
-        "HELM_TO_ARGOCD_CONTEXT",
-        "HELM_TO_ARGOCD_REPO_URL",
+        ENV_CONTEXT,
+        ENV_REPO_URL,
         ENV_RELEASE_NAME,
         ENV_TRACE_VALUES,
-        "HELM_TO_ARGOCD_K8S_CONNECT_TIMEOUT",
-        "HELM_TO_ARGOCD_K8S_READ_TIMEOUT",
+        ENV_K8S_CONNECT_TIMEOUT,
+        ENV_K8S_READ_TIMEOUT,
     ):
         monkeypatch.delenv(key, raising=False)
 

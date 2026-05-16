@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from helmadm.cli import PullCliOptions, app, run_pull
+from helmadm.env import ENV_NAMESPACE, ENV_RELEASE_NAME
 from helmadm.helm_release import (
     HELM_RELEASE_DATA_KEY,
     HelmReleaseNotFoundError,
@@ -272,7 +273,7 @@ def test_find_release_secret_missing_revision() -> None:
 
 
 def test_run_pull_writes_bundle(tmp_path: Path, clean_env, monkeypatch) -> None:
-    monkeypatch.setenv("HELM_TO_ARGOCD_NAMESPACE", "loki")
+    monkeypatch.setenv(ENV_NAMESPACE, "loki")
     options = PullCliOptions(
         namespace="loki",
         release_name="fluentbit",
@@ -307,7 +308,7 @@ def test_run_pull_writes_bundle(tmp_path: Path, clean_env, monkeypatch) -> None:
 
 
 def test_run_pull_tar_stdout(clean_env, monkeypatch) -> None:
-    monkeypatch.setenv("HELM_TO_ARGOCD_NAMESPACE", "loki")
+    monkeypatch.setenv(ENV_NAMESPACE, "loki")
     options = PullCliOptions(
         namespace="loki",
         release_name="fluentbit",
@@ -335,8 +336,8 @@ def test_run_pull_tar_stdout(clean_env, monkeypatch) -> None:
 
 
 def test_pull_cli_requires_output(clean_env, monkeypatch) -> None:
-    monkeypatch.setenv("HELM_TO_ARGOCD_NAMESPACE", "loki")
-    monkeypatch.setenv("HELM_TO_ARGOCD_RELEASE_NAME", "fluentbit")
+    monkeypatch.setenv(ENV_NAMESPACE, "loki")
+    monkeypatch.setenv(ENV_RELEASE_NAME, "fluentbit")
     result = runner.invoke(app, ["pull", "-n", "loki", "fluentbit"])
     assert result.exit_code == 2
     assert "--output" in result.stderr or "output" in result.stderr.lower()
