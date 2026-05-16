@@ -1,8 +1,7 @@
 from typing import Any
 
-import yaml
-
 from helmadm.logging_config import get_logger
+from helmadm.yaml_render import dump_yaml
 
 logger = get_logger("argocd_manifest")
 
@@ -112,19 +111,7 @@ def build_application(
     return manifest
 
 
-class _NoAliasDumper(yaml.SafeDumper):
-    """Avoid YAML anchors (e.g. valuesObject: &id001 {}) when dicts are reused."""
-
-    def ignore_aliases(self, data: object) -> bool:
-        return True
-
-
 def render_application(manifest: dict[str, Any]) -> str:
-    rendered = yaml.dump(
-        manifest,
-        Dumper=_NoAliasDumper,
-        default_flow_style=False,
-        sort_keys=False,
-    )
+    rendered = dump_yaml(manifest)
     logger.debug("rendered manifest to YAML (%d bytes)", len(rendered))
     return rendered

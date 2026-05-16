@@ -10,9 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-import yaml
-
-from helmadm.argocd_manifest import _NoAliasDumper, normalize_repo_url
+from helmadm.argocd_manifest import normalize_repo_url
+from helmadm.yaml_render import dump_yaml
 from helmadm.logging_config import get_logger
 
 logger = get_logger("pull_bundle")
@@ -78,12 +77,7 @@ def derive_repo_alias(repo_url: str) -> str:
 
 
 def render_values_yaml(values: dict[str, Any]) -> str:
-    return yaml.dump(
-        values,
-        Dumper=_NoAliasDumper,
-        default_flow_style=False,
-        sort_keys=False,
-    )
+    return dump_yaml(values)
 
 
 def build_pull_bundle(

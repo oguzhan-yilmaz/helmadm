@@ -82,6 +82,35 @@ def test_build_application(sample_release):
     }
 
 
+def test_render_application_multiline_strings_use_block_scalar(sample_release):
+    manifest = build_application(
+        sample_release,
+        {
+            "config": {
+                "inputs": "[INPUT]\n    Name tail\n    Path /var/log/containers/*.log\n",
+                "outputs": (
+                    "[OUTPUT]\\n    name loki\\n    match *\\n"
+                    "    # See logging-stack/loki.README.md \u2014 http://loki-gateway.loki.svc\\n"
+                ),
+                "extraFiles": {
+                    "labelmap.json": '{\\n  "kubernetes": {"namespace_name": "namespace"}\\n}\\n',
+                },
+            }
+        },
+        "https://fluent.github.io/helm-charts",
+    )
+    rendered = render_application(manifest)
+
+    assert 'inputs: "[INPUT]\\n' not in rendered
+    assert 'outputs: "[OUTPUT]\\n' not in rendered
+    assert "inputs: |\n" in rendered
+    assert "outputs: |\n" in rendered
+    assert "    Name tail\n" in rendered
+    assert "    name loki\n" in rendered
+    assert "labelmap.json: |\n" in rendered
+    assert '{\\n  "kubernetes"' not in rendered
+
+
 def test_render_application_uses_values_object_mapping(sample_release):
     manifest = build_application(sample_release, {}, "https://example.com/charts")
     rendered = render_application(manifest)
