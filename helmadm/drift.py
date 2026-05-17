@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 import yaml
 from kubernetes.dynamic import DynamicClient
+from kubernetes.dynamic.resource import ResourceList
 from kubernetes.dynamic.exceptions import (
     DynamicApiError,
     ResourceNotFoundError,
@@ -14,8 +15,12 @@ from kubernetes.dynamic.exceptions import (
 from kubernetes.dynamic.exceptions import ForbiddenError as DynamicForbiddenError
 from kubernetes.dynamic.exceptions import GoneError as DynamicGoneError
 from kubernetes.dynamic.exceptions import NotFoundError as DynamicNotFoundError
-from kubernetes.dynamic.resource import ResourceList
-
+from helmadm.drift_ssa import (
+    DriftCompareMode,
+    SSAUnsupportedError,
+    minimal_normalize,
+    ssa_merged_object,
+)
 from helmadm.env import get_k8s_request_timeout
 from helmadm.logging_config import get_logger
 
@@ -45,15 +50,27 @@ class ManifestObjectResult:
     severity: DriftSeverity = "ok"
     detail: str = ""
     diff: str | None = None
+    compare_method: DriftCompareMode | None = None
+    legacy_fallback_reason: str = ""
+
+
+@dataclass
+class ExtraObjectResult:
+    api_version: str
+    kind: str
+    namespace: str
+    name: str
 
 
 @dataclass
 class DriftReport:
     release_name: str
     namespace: str
+    compare_mode: DriftCompareMode = "ssa"
+    field_manager: str = "helm"
     items: list[ManifestObjectResult] = field(default_factory=list)
-    extras: list[tuple[str, str, str, str]] = field(default_factory=list)
-    """(apiVersion, kind, namespace, name) live objects in `-n` missing from manifest."""
+    extras: list[ExtraObjectResult] = field(default_factory=list)
+    """Namespace objects not labeled as managed by this Helm release."""
     extras_errors: list[str] = field(default_factory=list)
 
     @property
@@ -63,6 +80,30 @@ class DriftReport:
         if self.extras:
             return True
         return False
+
+
+def _validate_manifest_document(doc: dict[str, Any]) -> None:
+    if not isinstance(doc.get("apiVersion"), str):
+        raise ValueError("manifest object is missing apiVersion string")
+    if not isinstance(doc.get("kind"), str):
+        raise ValueError("manifest object is missing kind string")
+
+
+def _expand_manifest_list_document(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten a kubectl/Helm `List` wrapper into its member objects."""
+    items = doc.get("items")
+    if not isinstance(items, list):
+        raise ValueError("manifest List object is missing items array")
+    expanded: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"manifest List items[{idx}] is not an object "
+                f"(got {type(item).__name__})"
+            )
+        _validate_manifest_document(item)
+        expanded.append(item)
+    return expanded
 
 
 def parse_release_manifest(release: dict[str, Any]) -> list[dict[str, Any]]:
@@ -78,12 +119,21 @@ def parse_release_manifest(release: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(
                 f"Helm manifest document is not an object (got {type(doc).__name__})"
             )
-        if not isinstance(doc.get("apiVersion"), str):
-            raise ValueError("manifest object is missing apiVersion string")
-        if not isinstance(doc.get("kind"), str):
-            raise ValueError("manifest object is missing kind string")
+        if doc.get("kind") == "List":
+            out.extend(_expand_manifest_list_document(doc))
+            continue
+        _validate_manifest_document(doc)
         out.append(doc)
     return out
+
+
+def _resolve_resource_type(resource_type: Any) -> Any:
+    """Use the concrete API resource when discovery returned a *List wrapper."""
+    if isinstance(resource_type, ResourceList):
+        base = resource_type.base_resource()
+        if base is not None:
+            return base
+    return resource_type
 
 
 def sort_keys_deep(obj: Any) -> Any:
@@ -125,6 +175,19 @@ _WORKLOAD_POD_TEMPLATE_KINDS = frozenset(
         "StatefulSet",
     }
 )
+
+
+def drift_ssa_annotation_lines() -> list[str]:
+    """Human-readable ``# helmadm:`` lines for SSA merged-vs-live diffs."""
+    helm_ann = ", ".join(sorted(_HELM_INSTALL_ONLY_ANNOTATION_KEYS))
+    kubectl_ann = ", ".join(sorted(_KUBECTL_RUNTIME_ANNOTATION_KEYS))
+    return [
+        "# helmadm: Unified diff below compares SSA dry-run merged vs live.",
+        "# helmadm: Stripped before compare/diff: status; metadata.managedFields.",
+        f"# helmadm: Stripped annotations: {helm_ann}; {kubectl_ann}.",
+        "# helmadm: Stripped label app.kubernetes.io/managed-by when value is Helm.",
+        "# helmadm: Merged = API server result of apply-patch dry-run (field manager helm).",
+    ]
 
 
 def drift_ignore_annotation_lines(kind: str) -> list[str]:
@@ -409,7 +472,9 @@ def _manifest_namespace_for_compare(
     try:
         api_version = obj["apiVersion"]
         kind = obj["kind"]
-        res_type = dyn.resources.get(api_version=api_version, kind=kind)
+        res_type = _resolve_resource_type(
+            dyn.resources.get(api_version=api_version, kind=kind)
+        )
         if res_type.namespaced:
             manifest_ns_obj = ""
             md = obj.get("metadata") or {}
@@ -478,7 +543,9 @@ def fetch_live_object(
         return None, lookup_err
 
     try:
-        resource_type = dyn.resources.get(api_version=api_version, kind=kind)
+        resource_type = _resolve_resource_type(
+            dyn.resources.get(api_version=api_version, kind=kind)
+        )
     except ResourceNotFoundError as exc:
         return (
             None,
@@ -488,9 +555,9 @@ def fetch_live_object(
     try:
         if resource_type.namespaced:
             ns = resolved_ns_for_get if resolved_ns_for_get is not None else release_namespace
-            inst = resource_type.get(namespace=ns, name=name, **timeout_kw)
+            inst = dyn.get(resource_type, namespace=ns, name=name, **timeout_kw)
         else:
-            inst = resource_type.get(name=name, **timeout_kw)
+            inst = dyn.get(resource_type, name=name, **timeout_kw)
     except DynamicNotFoundError:
         return None, "missing"
     except DynamicGoneError:
@@ -511,11 +578,22 @@ def _unified_diff_filenames(
     kind: str,
     namespace: str,
     name: str,
+    *,
+    from_prefix: str = "manifest",
 ) -> tuple[str, str]:
     """Paths shown in unified-diff headers (readable in delta / git-style viewers)."""
     ns_seg = namespace.strip() if namespace.strip() else "cluster-scoped"
     core = f"{api_version}/{kind}/{ns_seg}/{name}"
-    return (f"manifest/{core}", f"live/{core}")
+    return (f"{from_prefix}/{core}", f"live/{core}")
+
+
+def _canonical_yaml_for_ssa_diff(obj: dict[str, Any]) -> str:
+    return yaml.safe_dump(
+        minimal_normalize(obj),
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
 
 
 def _unified_yaml_diff(
@@ -526,10 +604,18 @@ def _unified_yaml_diff(
     kind: str,
     namespace: str,
     name: str,
+    compare_method: DriftCompareMode = "legacy",
 ) -> str:
-    from_file, to_file = _unified_diff_filenames(api_version, kind, namespace, name)
-    a = canonical_yaml_for_diff(expected_obj, drift_side="manifest").splitlines(True)
-    b = canonical_yaml_for_diff(live_obj, drift_side="live").splitlines(True)
+    from_prefix = "merged" if compare_method == "ssa" else "manifest"
+    from_file, to_file = _unified_diff_filenames(
+        api_version, kind, namespace, name, from_prefix=from_prefix
+    )
+    if compare_method == "ssa":
+        a = _canonical_yaml_for_ssa_diff(expected_obj).splitlines(True)
+        b = _canonical_yaml_for_ssa_diff(live_obj).splitlines(True)
+    else:
+        a = canonical_yaml_for_diff(expected_obj, drift_side="manifest").splitlines(True)
+        b = canonical_yaml_for_diff(live_obj, drift_side="live").splitlines(True)
     lines_list = list(
         difflib.unified_diff(
             a,
@@ -544,83 +630,306 @@ def _unified_yaml_diff(
     return "".join(lines_list).rstrip() + "\n"
 
 
+# kubectl get all-style types (omit Pod/ReplicaSet — controller children, not in manifest by name).
+_EXTRAS_API_RESOURCES: tuple[tuple[str, str], ...] = (
+    ("v1", "Service"),
+    ("v1", "ConfigMap"),
+    ("v1", "Secret"),
+    ("v1", "PersistentVolumeClaim"),
+    ("v1", "ServiceAccount"),
+    ("apps/v1", "Deployment"),
+    ("apps/v1", "StatefulSet"),
+    ("apps/v1", "DaemonSet"),
+    ("batch/v1", "Job"),
+    ("batch/v1", "CronJob"),
+    ("networking.k8s.io/v1", "Ingress"),
+    ("autoscaling/v2", "HorizontalPodAutoscaler"),
+)
+
+_NAMESPACE_SYSTEM_CONFIGMAP = "kube-root-ca.crt"
+_NAMESPACE_DEFAULT_SERVICE_ACCOUNT = "default"
+
+_HELM_RELEASE_SECRET_NAME_PREFIX = "sh.helm.release.v1."
+_HELM_RELEASE_NAME_LABEL = "meta.helm.sh/release-name"
+_HELM_RELEASE_NAMESPACE_LABEL = "meta.helm.sh/release-namespace"
+
+
+def _list_item_to_dict(item: Any) -> dict[str, Any] | None:
+    if isinstance(item, dict):
+        return item
+    to_dict = getattr(item, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        return converted if isinstance(converted, dict) else None
+    return None
+
+
+def _is_managed_by_helm_release(
+    md: dict[str, Any],
+    *,
+    release_name: str,
+    release_namespace: str,
+) -> bool:
+    """True when Helm labels mark this object as part of the given release."""
+    labels = md.get("labels")
+    if not isinstance(labels, dict):
+        return False
+    if labels.get(_HELM_RELEASE_NAME_LABEL) != release_name:
+        return False
+    helm_ns = labels.get(_HELM_RELEASE_NAMESPACE_LABEL)
+    if helm_ns is not None and str(helm_ns) != release_namespace:
+        return False
+    return True
+
+
+def _in_release_manifest(
+    *,
+    api_version: str,
+    kind: str,
+    namespace: str,
+    name: str,
+    manifest_keys: set[tuple[str, str, str, str]],
+) -> bool:
+    return (api_version, kind, namespace, name) in manifest_keys
+
+
+def _belongs_to_this_release(
+    item: dict[str, Any],
+    *,
+    api_version: str,
+    kind: str,
+    namespace: str,
+    name: str,
+    release_name: str,
+    release_namespace: str,
+    manifest_keys: set[tuple[str, str, str, str]],
+) -> bool:
+    """Helm labels or object present in this release's stored manifest."""
+    md = item.get("metadata") or {}
+    if isinstance(md, dict) and _is_managed_by_helm_release(
+        md,
+        release_name=release_name,
+        release_namespace=release_namespace,
+    ):
+        return True
+    return _in_release_manifest(
+        api_version=api_version,
+        kind=kind,
+        namespace=namespace,
+        name=name,
+        manifest_keys=manifest_keys,
+    )
+
+
 def _should_skip_extras_list_item(item: dict[str, Any]) -> bool:
-    """Helm 3 release payloads live here and are never chart manifest objects."""
-    return item.get("kind") == "Secret" and item.get("type") == "helm.sh/release.v1"
+    """Skip Helm storage secrets and namespace system objects."""
+    kind = item.get("kind") or ""
+    md = item.get("metadata") or {}
+    name = str(md.get("name") or "") if isinstance(md, dict) else ""
+
+    if kind == "ConfigMap" and name == _NAMESPACE_SYSTEM_CONFIGMAP:
+        return True
+    if kind == "ServiceAccount" and name == _NAMESPACE_DEFAULT_SERVICE_ACCOUNT:
+        return True
+
+    if kind == "Secret":
+        if item.get("type") == "helm.sh/release.v1":
+            return True
+        if name.startswith(_HELM_RELEASE_SECRET_NAME_PREFIX):
+            return True
+    return False
 
 
-def _iter_namespaced_listable(dyn: DynamicClient):
-    """Namespaced Kubernetes resources that support LIST (for `--detect-extras`)."""
-    for resource_type in dyn.resources:
-        if isinstance(resource_type, ResourceList):
+def _iter_extras_api_resources(
+    dyn: DynamicClient,
+) -> list[tuple[str, str, Any]]:
+    """Resolve curated (apiVersion, kind) pairs for namespace listing."""
+    resolved: list[tuple[str, str, Any]] = []
+    for api_version, kind in _EXTRAS_API_RESOURCES:
+        try:
+            resource_type = dyn.resources.get(api_version=api_version, kind=kind)
+        except ResourceNotFoundError:
+            logger.debug(
+                "detect-extras: API %s/%s not installed, skipping", api_version, kind
+            )
             continue
-        kind_name = getattr(resource_type, "kind", "") or ""
-        if kind_name.endswith("List"):
-            continue
-        verbs = getattr(resource_type, "verbs", None)
-        if not verbs or "list" not in verbs:
-            continue
-        if not getattr(resource_type, "namespaced", False):
-            continue
-        yield resource_type
+        resolved.append((api_version, kind, resource_type))
+    return resolved
+
+
+def _list_namespaced_resources(
+    dyn: DynamicClient,
+    resource_type: Any,
+    *,
+    namespace: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """LIST all pages for a namespaced resource type in one namespace."""
+    tt = dict(_request_timeout=get_k8s_request_timeout())
+    default_gv = getattr(resource_type, "group_version", "") or getattr(
+        resource_type, "api_version", ""
+    )
+    default_kind = getattr(resource_type, "kind", "") or ""
+    collected: list[dict[str, Any]] = []
+    continue_token: str | None = None
+
+    while True:
+        list_kwargs = dict(tt)
+        if continue_token:
+            list_kwargs["_continue"] = continue_token
+        try:
+            inst = dyn.get(resource_type, namespace=namespace, **list_kwargs)
+        except DynamicForbiddenError as exc:
+            return collected, f"list forbidden: {exc.summary()}"
+        except DynamicApiError as exc:
+            return collected, f"list failed ({exc.status}): {exc.summary()}"
+
+        body = inst.to_dict()
+        for raw_item in body.get("items") or []:
+            item = _list_item_to_dict(raw_item)
+            if item is None:
+                continue
+            if not item.get("apiVersion") and default_gv:
+                item["apiVersion"] = default_gv
+            if not item.get("kind") and default_kind:
+                item["kind"] = default_kind
+            collected.append(item)
+
+        meta = body.get("metadata") or {}
+        continue_token = meta.get("continue") if isinstance(meta, dict) else None
+        if not continue_token:
+            break
+
+    return collected, None
 
 
 def _collect_extras_live(
     dyn: DynamicClient,
     *,
     release_namespace: str,
+    release_name: str,
     manifest_keys: set[tuple[str, str, str, str]],
-) -> tuple[list[tuple[str, str, str, str]], list[str]]:
-    """List every namespaced API kind in the namespace; extras are objects absent from manifest."""
-    tt = dict(_request_timeout=get_k8s_request_timeout())
-    extras: dict[tuple[str, str, str, str], bool] = {}
+) -> tuple[list[ExtraObjectResult], list[str]]:
+    """Namespace objects not in this release manifest and not Helm-labeled for it."""
+    extras_by_key: dict[tuple[str, str, str, str], ExtraObjectResult] = {}
     errs: list[str] = []
 
-    for resource_type in _iter_namespaced_listable(dyn):
-        rk = getattr(resource_type, "kind", None)
-        gv = getattr(resource_type, "group_version", "") or getattr(
-            resource_type, "api_version", ""
-        )
+    for api_version, kind, resource_type in _iter_extras_api_resources(dyn):
         logger.debug(
-            "detect-extras: listing %s/%s ns=%s (no label filter)",
-            gv,
-            rk,
+            "detect-extras: listing %s/%s ns=%s",
+            api_version,
+            kind,
             release_namespace,
         )
-        try:
-            inst = resource_type.get(
-                namespace=release_namespace,
-                **tt,
-            )
-        except DynamicForbiddenError as exc:
-            errs.append(f"list forbidden {gv}/{rk}: {exc.summary()}")
+        items, list_err = _list_namespaced_resources(
+            dyn, resource_type, namespace=release_namespace
+        )
+        if list_err:
+            errs.append(f"{api_version}/{kind}: {list_err}")
             continue
-        except DynamicApiError as exc:
-            errs.append(f"list failed {gv}/{rk}: ({exc.status}) {exc.summary()}")
-            continue
-        body = inst.to_dict()
-        items_raw = body.get("items") or []
-        for item in items_raw:
-            if not isinstance(item, dict):
-                continue
+
+        for item in items:
             if _should_skip_extras_list_item(item):
                 continue
             md = item.get("metadata") or {}
             if not isinstance(md, dict):
                 continue
-            n = md.get("name") or ""
-            av = item.get("apiVersion")
-            kd = item.get("kind") or rk
-            if not av or not n:
+            n = str(md.get("name") or "").strip()
+            if not n:
                 continue
-            key = (str(av), str(kd), release_namespace, str(n))
-            extras[key] = True
+            if _belongs_to_this_release(
+                item,
+                api_version=api_version,
+                kind=kind,
+                namespace=release_namespace,
+                name=n,
+                release_name=release_name,
+                release_namespace=release_namespace,
+                manifest_keys=manifest_keys,
+            ):
+                continue
+            key = (api_version, kind, release_namespace, n)
+            extras_by_key[key] = ExtraObjectResult(
+                api_version=api_version,
+                kind=kind,
+                namespace=release_namespace,
+                name=n,
+            )
 
-    extra_keys_sorted = sorted(
-        (key for key in extras if key not in manifest_keys),
-        key=lambda item: item[1],
+    extra_sorted = sorted(
+        extras_by_key.values(),
+        key=lambda item: (item.kind, item.name),
     )
-    return extra_keys_sorted, errs
+    return extra_sorted, errs
+
+
+def _ssa_drift_detail(merged: dict[str, Any], live: dict[str, Any]) -> str:
+    merged_replicas = effective_spec_replicas(merged)
+    live_replicas = effective_spec_replicas(live)
+    if (
+        merged_replicas is not None
+        and live_replicas is not None
+        and merged_replicas != live_replicas
+    ):
+        return (
+            f"spec.replicas differs (merged {merged_replicas}, live {live_replicas})"
+        )
+    return "SSA merged object differs from live object"
+
+
+def _legacy_compare_object(
+    obj: dict[str, Any],
+    live: dict[str, Any],
+    *,
+    api_version: str,
+    kind: str,
+    namespace: str,
+    name: str,
+) -> ManifestObjectResult:
+    expected_norm_dict = normalize_for_compare(obj, drift_side="manifest")
+    live_norm = normalize_for_compare(live, drift_side="live")
+    replica_drift = replicas_mismatch(obj, live)
+    if replica_drift:
+        logger.debug(
+            "replica drift %s/%s %s: manifest=%s live=%s",
+            kind,
+            name,
+            namespace,
+            effective_spec_replicas(obj),
+            effective_spec_replicas(live),
+        )
+    if expected_norm_dict == live_norm and not replica_drift:
+        return ManifestObjectResult(
+            api_version=api_version,
+            kind=kind,
+            namespace=namespace,
+            name=name,
+            severity="ok",
+            compare_method="legacy",
+        )
+    detail = "release manifest differs from live object spec/metadata"
+    if replica_drift:
+        detail = (
+            f"spec.replicas differs (manifest "
+            f"{effective_spec_replicas(obj)}, live {effective_spec_replicas(live)})"
+        )
+    return ManifestObjectResult(
+        api_version=api_version,
+        kind=kind,
+        namespace=namespace,
+        name=name,
+        severity="drift",
+        detail=detail,
+        compare_method="legacy",
+        diff=_unified_yaml_diff(
+            obj,
+            live,
+            api_version=api_version,
+            kind=kind,
+            namespace=namespace,
+            name=name,
+            compare_method="legacy",
+        ),
+    )
 
 
 def run_drift(
@@ -630,9 +939,17 @@ def run_drift(
     release_namespace: str,
     release_name: str,
     detect_extras: bool,
+    compare_mode: DriftCompareMode = "ssa",
+    field_manager: str = "helm",
+    verbose: bool = False,
 ) -> DriftReport:
     objs = parse_release_manifest(release)
-    report = DriftReport(release_name=release_name, namespace=release_namespace)
+    report = DriftReport(
+        release_name=release_name,
+        namespace=release_namespace,
+        compare_mode=compare_mode,
+        field_manager=field_manager,
+    )
     manifest_keys: set[tuple[str, str, str, str]] = set()
 
     for obj in objs:
@@ -658,7 +975,6 @@ def run_drift(
         live, err_msg = fetch_live_object(
             dyn, obj, release_namespace=release_namespace
         )
-        expected_norm_dict = normalize_for_compare(obj, drift_side="manifest")
 
         if err_msg and err_msg not in {"missing", "gone"}:
             report.items.append(
@@ -704,49 +1020,97 @@ def run_drift(
             )
             continue
 
-        live_norm = normalize_for_compare(live, drift_side="live")
-        replica_drift = replicas_mismatch(obj, live)
-        if replica_drift:
+        item_ns = ns_eff or release_namespace
+
+        if compare_mode == "legacy":
+            report.items.append(
+                _legacy_compare_object(
+                    obj,
+                    live,
+                    api_version=api_version,
+                    kind=kind,
+                    namespace=item_ns,
+                    name=nm,
+                )
+            )
+            continue
+
+        use_legacy = False
+        legacy_reason = ""
+        merged: dict[str, Any] | None = None
+        try:
+            merged = ssa_merged_object(
+                dyn,
+                obj,
+                resolved_namespace=ns_eff or None,
+                field_manager=field_manager,
+            )
+        except SSAUnsupportedError as exc:
+            use_legacy = True
+            legacy_reason = str(exc)
             logger.debug(
-                "replica drift %s/%s %s: manifest=%s live=%s",
+                "SSA unavailable for %s/%s %s: %s",
+                api_version,
                 kind,
                 nm,
-                ns_eff or release_namespace,
-                effective_spec_replicas(obj),
-                effective_spec_replicas(live),
+                exc,
             )
-        if expected_norm_dict == live_norm and not replica_drift:
+
+        if use_legacy:
+            result = _legacy_compare_object(
+                obj,
+                live,
+                api_version=api_version,
+                kind=kind,
+                namespace=item_ns,
+                name=nm,
+            )
+            result.legacy_fallback_reason = legacy_reason
+            if verbose and legacy_reason:
+                result.detail = (
+                    f"{result.detail}; legacy fallback: {legacy_reason}"
+                    if result.detail and result.severity == "drift"
+                    else (
+                        f"legacy fallback: {legacy_reason}"
+                        if result.severity == "ok"
+                        else result.detail
+                    )
+                )
+            report.items.append(result)
+            continue
+
+        assert merged is not None
+        merged_norm = minimal_normalize(merged)
+        live_norm = minimal_normalize(live)
+        if merged_norm == live_norm:
             report.items.append(
                 ManifestObjectResult(
                     api_version=api_version,
                     kind=kind,
-                    namespace=(ns_eff or release_namespace),
+                    namespace=item_ns,
                     name=nm,
                     severity="ok",
+                    compare_method="ssa",
                 )
             )
         else:
-            detail = "release manifest differs from live object spec/metadata"
-            if replica_drift:
-                detail = (
-                    f"spec.replicas differs (manifest "
-                    f"{effective_spec_replicas(obj)}, live {effective_spec_replicas(live)})"
-                )
             report.items.append(
                 ManifestObjectResult(
                     api_version=api_version,
                     kind=kind,
-                    namespace=(ns_eff or release_namespace),
+                    namespace=item_ns,
                     name=nm,
                     severity="drift",
-                    detail=detail,
+                    detail=_ssa_drift_detail(merged, live),
+                    compare_method="ssa",
                     diff=_unified_yaml_diff(
-                        obj,
+                        merged,
                         live,
                         api_version=api_version,
                         kind=kind,
-                        namespace=(ns_eff or release_namespace),
+                        namespace=item_ns,
                         name=nm,
+                        compare_method="ssa",
                     ),
                 )
             )
@@ -755,6 +1119,7 @@ def run_drift(
         extra_list, errs = _collect_extras_live(
             dyn,
             release_namespace=release_namespace,
+            release_name=release_name,
             manifest_keys=manifest_keys,
         )
         report.extras = extra_list
@@ -767,19 +1132,35 @@ def format_report_text(
     report: DriftReport,
     *,
     ignore_annotations: bool = False,
+    verbose: bool = False,
 ) -> str:
     lines: list[str] = []
     hr = "=" * 64
     lines.append(hr)
+    compare_desc = (
+        "SSA dry-run merged vs live API"
+        if report.compare_mode == "ssa"
+        else "legacy manifest normalization vs live API"
+    )
     lines.append(
         f"Helm drift: release {report.release_name!r} "
-        f"namespace {report.namespace!r} (stored release manifest vs live API; read-only)"
+        f"namespace {report.namespace!r} ({compare_desc}; read-only)"
     )
-    if ignore_annotations:
+    if report.compare_mode == "ssa":
         lines.append(
-            "# helmadm: --ignore-annotations / -ia: normalization rules per drift item "
-            "(see helmadm drift --help)."
+            f"# helmadm: compare-mode=ssa field-manager={report.field_manager!r}"
         )
+    if ignore_annotations:
+        if report.compare_mode == "ssa":
+            lines.append(
+                "# helmadm: --ignore-annotations / -ia: notes per drift item "
+                "(SSA merged vs live; legacy fallback uses normalization rules)."
+            )
+        else:
+            lines.append(
+                "# helmadm: --ignore-annotations / -ia: normalization rules per drift item "
+                "(see helmadm drift --help)."
+            )
     lines.append(hr)
 
     severity_order = {"fetch_error": 0, "missing": 1, "drift": 2, "ok": 3}
@@ -796,26 +1177,35 @@ def format_report_text(
         lines.append(f"{prefix} {ident}")
         if item.detail.strip():
             lines.append(f"    {item.detail}")
+        if (
+            verbose
+            and item.legacy_fallback_reason
+            and item.compare_method == "legacy"
+        ):
+            lines.append(
+                f"    # helmadm: SSA unavailable, legacy compare: "
+                f"{item.legacy_fallback_reason}"
+            )
         if item.diff and item.severity == "drift":
             if ignore_annotations:
-                for note in drift_ignore_annotation_lines(item.kind):
-                    lines.append(note)
+                if item.compare_method == "ssa":
+                    for note in drift_ssa_annotation_lines():
+                        lines.append(note)
+                else:
+                    for note in drift_ignore_annotation_lines(item.kind):
+                        lines.append(note)
             for diff_line in item.diff.rstrip().splitlines():
                 lines.append(diff_line.rstrip())
 
-    if report.extras:
+    for extra in report.extras:
         lines.append(
-            "--- Namespace objects not in release manifest "
-            "(full LIST per API kind; includes resources without Helm labels) ---"
+            f"[extra] {extra.api_version}/{extra.kind} "
+            f"{extra.namespace}/{extra.name}"
         )
-        for av, k, ns, n in sorted(report.extras):
-            suffix = f" {ns}/{n}" if ns else f"/{n}"
-            lines.append(f"[extra] {av}/{k}{suffix}")
 
-    if report.extras_errors:
-        lines.append("--- while scanning for extras ---")
+    if verbose and report.extras_errors:
         for err in report.extras_errors:
-            lines.append(err)
+            lines.append(f"# helmadm: detect-extras: {err}")
 
     total = len(report.items)
     bad = sum(1 for item in report.items if item.severity != "ok")

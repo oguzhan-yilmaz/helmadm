@@ -49,6 +49,7 @@ from helmadm.pull_bundle import (
     write_pull_bundle_tar,
 )
 from helmadm.drift import format_report_text, parse_release_manifest, run_drift
+from helmadm.drift_ssa import DriftCompareMode
 from helmadm.k8s import (
     KubernetesApiError,
     check_kubernetes_accessible,
@@ -479,6 +480,9 @@ def run_drift_command(
     context: str | None,
     detect_extras: bool,
     ignore_annotations: bool = False,
+    compare_mode: DriftCompareMode = "ssa",
+    field_manager: str = "helm",
+    verbose: bool = False,
 ) -> int:
     client_kwargs = _kubernetes_client_kwargs(
         kubeconfig=kubeconfig,
@@ -536,9 +540,16 @@ def run_drift_command(
         release_namespace=namespace,
         release_name=release_name,
         detect_extras=detect_extras,
+        compare_mode=compare_mode,
+        field_manager=field_manager,
+        verbose=verbose,
     )
     typer.echo(
-        format_report_text(report, ignore_annotations=ignore_annotations)
+        format_report_text(
+            report,
+            ignore_annotations=ignore_annotations,
+            verbose=verbose,
+        )
     )
     return 1 if report.has_problem else 0
 
@@ -758,9 +769,8 @@ def drift_command(
         typer.Option(
             "--detect-extras",
             help=(
-                "LIST every namespaced API kind in -n and flag objects not in the release "
-                "manifest (includes unlabeled resources; needs broad list RBAC). "
-                "Helm release storage secrets (helm.sh/release.v1) are skipped."
+                "List namespace resources and print one [extra] line per object not in this "
+                "release manifest and not labeled meta.helm.sh/release-name for this release."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
@@ -771,17 +781,46 @@ def drift_command(
             "--ignore-annotations",
             "-ia",
             help=(
-                "Before each unified diff, print # helmadm lines listing normalization rules "
-                "(metadata noise, Helm/kubectl annotations, Service clusterIP/nodePort, "
-                "Pod template defaults, …)."
+                "Before each unified diff, print # helmadm lines describing compare rules "
+                "(SSA merged vs live, or legacy normalization when SSA is unavailable)."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
     ] = False,
+    compare_mode: Annotated[
+        DriftCompareMode,
+        typer.Option(
+            "--compare-mode",
+            help=(
+                "Compare strategy: [cyan]ssa[/cyan] (default) uses server-side apply dry-run "
+                "merged vs live; [cyan]legacy[/cyan] uses client-side normalization."
+            ),
+            case_sensitive=False,
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = "ssa",
+    field_manager: Annotated[
+        str,
+        typer.Option(
+            "--field-manager",
+            help="Field manager for SSA dry-run apply (default: helm).",
+            rich_help_panel=PANEL_RELEASE,
+        ),
+    ] = "helm",
 ) -> None:
     """
     Compare each object in the Helm release [cyan]manifest[/cyan] (from the latest revision secret)
     to a fresh live API [cyan]GET[/cyan] — there is no cache between runs.
+
+  Default ([cyan]--compare-mode ssa[/cyan]): for each manifest object, the API server computes
+  what the object would look like after server-side apply (dry-run, field manager [cyan]helm[/cyan]),
+  then compares that [cyan]merged[/cyan] result to [cyan]live[/cyan]. Drifting objects get a unified
+  diff ([cyan]merged/...[/cyan] vs [cyan]live/...[/cyan]). This matches [cyan]kubectl diff --server-side[/cyan]
+  semantics without requiring kubectl.
+
+  When SSA is unavailable for a resource (some CRDs), helmadm falls back to legacy client-side
+  normalization automatically ([cyan]-v[/cyan] logs the reason). Use [cyan]--compare-mode legacy[/cyan]
+  to force the old behavior for every object.
 
     [cyan]kubectl scale[/cyan] / replica edits on [cyan]Deployment[/cyan], [cyan]StatefulSet[/cyan], or
     [cyan]ReplicaSet[/cyan] objects in the manifest should appear as drift unless a controller
@@ -790,16 +829,10 @@ def drift_command(
     Does **not** run helm upgrade or kubectl apply. Helm hook manifests are not in [cyan]manifest[/cyan]
     and are not checked.
 
-    Before compare, both sides are normalized (drop [cyan]status[/cyan], server metadata, Helm/kubectl
-    install-time annotations, common Service and Pod defaults, etc.). Drifting objects get a unified
-    diff ([cyan]manifest/...[/cyan] vs [cyan]live/...[/cyan]). False positives are still possible
-    (e.g. env list order, Secret [cyan]data[/cyan] vs [cyan]stringData[/cyan]).
+    Use [cyan]--ignore-annotations[/cyan] / [cyan]-ia[/cyan] to print compare notes above each diff.
 
-    Use [cyan]--ignore-annotations[/cyan] / [cyan]-ia[/cyan] to print the full normalization checklist
-    above each diff. Without it, only the diff is shown.
-
-    [cyan]--detect-extras[/cyan] reports namespaced objects in [cyan]-n[/cyan] that are absent from
-    the manifest (manual installs, other controllers).
+    [cyan]--detect-extras[/cyan] lists the release namespace and prints one [cyan][extra][/cyan] line
+    per object not managed by this Helm release (no [cyan]meta.helm.sh/release-name[/cyan] label).
 
     Exit [cyan]0[/cyan] when every manifest object matches; [cyan]1[/cyan] on drift, missing object,
     fetch error, or any extra (with [cyan]--detect-extras[/cyan]).
@@ -811,6 +844,7 @@ def drift_command(
       helmadm drift -n monitoring prometheus | delta -s
       helmadm drift --detect-extras -n monitoring prometheus
       helmadm drift -ia -n kube-system traefik
+      helmadm drift --compare-mode legacy -n monitoring prometheus
     """
     _apply_command_verbose(verbose)
     resolved_namespace = resolve_namespace(namespace, kubeconfig)
@@ -851,6 +885,9 @@ def drift_command(
             context=resolved_context,
             detect_extras=detect_extras,
             ignore_annotations=ignore_annotations,
+            compare_mode=compare_mode,
+            field_manager=field_manager,
+            verbose=verbose,
         )
     )
 

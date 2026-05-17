@@ -26,13 +26,18 @@ helmadm ls --no-detail
 
 Compare each object in the Helm release `manifest` (from the latest revision secret) to a live API `GET`. Read-only: no `helm upgrade` or `kubectl apply`.
 
-Before compare, both sides are normalized (drop `status`, server metadata, Helm/kubectl install annotations, common Service and Pod defaults, etc.). Drifting objects get a unified diff (`manifest/...` vs `live/...`).
+**Default compare (`--compare-mode ssa`):** for each manifest object, the API server runs a server-side apply dry-run (field manager `helm` by default) and returns the merged object. That result is compared to live after stripping only `status` and `metadata.managedFields`. Drifting objects get a unified diff (`merged/...` vs `live/...`). This matches `kubectl diff --server-side` semantics without requiring kubectl.
+
+When SSA is unavailable for a resource (some CRDs), helmadm automatically falls back to legacy client-side normalization (`manifest/...` vs `live/...`). Use `-v` to see fallback reasons. Force legacy for all objects with `--compare-mode legacy`.
 
 | Option | Description |
 |--------|-------------|
 | `-n` / `--namespace` | Release namespace (required unless set via env / kubeconfig default) |
-| `--detect-extras` | List namespaced objects in `-n` not in the manifest (needs broad list RBAC) |
-| `--ignore-annotations` / `-ia` | Print normalization rules before each diff |
+| `--compare-mode` | `ssa` (default) or `legacy` |
+| `--field-manager` | Field manager for SSA dry-run (default: `helm`) |
+| `--detect-extras` | One `[extra]` line per object (kubectl-all-style list) missing Helm release labels |
+| `--ignore-annotations` / `-ia` | Print compare notes before each diff |
+| `-v` / `--verbose` | Debug logging; SSA fallback reasons in report |
 | `--kubeconfig`, `--context` | Kubernetes client |
 
 **Exit codes:** `0` when every manifest object matches; `1` on drift, missing object, fetch error, or extras (with `--detect-extras`).
@@ -44,6 +49,7 @@ helmadm drift -n monitoring prometheus
 helmadm drift -n monitoring prometheus | delta -s
 helmadm drift --detect-extras -n monitoring prometheus
 helmadm drift -ia -n kube-system traefik
+helmadm drift --compare-mode legacy -n monitoring prometheus
 helmadm drift -n monitoring blackbox-exporter -ia -v | delta -s --paging never
 ```
 
