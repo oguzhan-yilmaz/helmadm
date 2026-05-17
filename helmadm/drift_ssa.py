@@ -17,6 +17,21 @@ logger = get_logger("drift_ssa")
 
 DriftCompareMode = Literal["ssa", "legacy"]
 
+# Helm/kubectl add these at install; chart manifests in release.manifest often omit them.
+_HELM_INSTALL_ANNOTATION_KEYS = frozenset(
+    {
+        "meta.helm.sh/release-name",
+        "meta.helm.sh/release-namespace",
+    }
+)
+_KUBECTL_RUNTIME_ANNOTATION_KEYS = frozenset(
+    {
+        "kubectl.kubernetes.io/restartedAt",
+        "kubectl.kubernetes.io/last-applied-configuration",
+    }
+)
+_HELM_MANAGED_BY_LABEL = "app.kubernetes.io/managed-by"
+
 
 def _sort_keys_deep(obj: Any) -> Any:
     if isinstance(obj, dict):
@@ -33,13 +48,42 @@ class SSAUnsupportedError(Exception):
     """SSA dry-run cannot be used for this object; caller should use legacy compare."""
 
 
+def _strip_install_metadata(md: dict[str, Any]) -> None:
+    """Remove Helm/kubectl install-time metadata not present in chart manifests."""
+    md.pop("managedFields", None)
+    ann = md.get("annotations")
+    if isinstance(ann, dict):
+        for key in _HELM_INSTALL_ANNOTATION_KEYS:
+            ann.pop(key, None)
+        for key in _KUBECTL_RUNTIME_ANNOTATION_KEYS:
+            ann.pop(key, None)
+        if not ann:
+            md.pop("annotations", None)
+    labels = md.get("labels")
+    if isinstance(labels, dict):
+        if labels.get(_HELM_MANAGED_BY_LABEL) == "Helm":
+            labels.pop(_HELM_MANAGED_BY_LABEL, None)
+        if not labels:
+            md.pop("labels", None)
+
+
+def _strip_install_metadata_recursive(obj: Any) -> None:
+    if isinstance(obj, dict):
+        md = obj.get("metadata")
+        if isinstance(md, dict):
+            _strip_install_metadata(md)
+        for value in obj.values():
+            _strip_install_metadata_recursive(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            _strip_install_metadata_recursive(item)
+
+
 def minimal_normalize(obj: dict[str, Any]) -> dict[str, Any]:
-    """Strip only status and metadata.managedFields (kubectl omitManagedFields equivalent)."""
+    """Strip status, managedFields, and Helm/kubectl install metadata before SSA compare."""
     c = copy.deepcopy(obj)
     c.pop("status", None)
-    md = c.get("metadata")
-    if isinstance(md, dict):
-        md.pop("managedFields", None)
+    _strip_install_metadata_recursive(c)
     return _sort_keys_deep(c)
 
 

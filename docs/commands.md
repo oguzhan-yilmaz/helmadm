@@ -35,7 +35,7 @@ When SSA is unavailable for a resource (some CRDs), helmadm automatically falls 
 | `-n` / `--namespace` | Release namespace (required unless set via env / kubeconfig default) |
 | `--compare-mode` | `ssa` (default) or `legacy` |
 | `--field-manager` | Field manager for SSA dry-run (default: `helm`) |
-| `--detect-extras` | List namespaced objects in `-n` not in the manifest (needs broad list RBAC) |
+| `--detect-extras` | One `[extra]` line per object (kubectl-all-style list) missing Helm release labels |
 | `--ignore-annotations` / `-ia` | Print compare notes before each diff |
 | `-v` / `--verbose` | Debug logging; SSA fallback reasons in report |
 | `--kubeconfig`, `--context` | Kubernetes client |

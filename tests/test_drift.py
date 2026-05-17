@@ -14,11 +14,15 @@ from helmadm.drift import (
     effective_spec_replicas,
     replicas_mismatch,
     DriftReport,
+    ExtraObjectResult,
     ManifestObjectResult,
+    _collect_extras_live,
+    _is_managed_by_helm_release,
     _should_skip_extras_list_item,
     _unified_yaml_diff,
     drift_ignore_annotation_lines,
     drift_ssa_annotation_lines,
+    fetch_live_object,
     format_report_text,
     normalize_for_compare,
     parse_release_manifest,
@@ -76,6 +80,32 @@ def test_parse_release_manifest_empty_returns_empty(sample_release: dict) -> Non
     assert parse_release_manifest(r) == []
 
 
+def test_parse_release_manifest_expands_list_documents() -> None:
+    release = {
+        "manifest": """---
+apiVersion: v1
+kind: List
+metadata:
+  name: bundled-rules
+items:
+- apiVersion: monitoring.coreos.com/v1
+  kind: PrometheusRule
+  metadata:
+    name: rule-a
+    namespace: monitoring
+- apiVersion: monitoring.coreos.com/v1
+  kind: PrometheusRule
+  metadata:
+    name: rule-b
+    namespace: monitoring
+""",
+    }
+    objs = parse_release_manifest(release)
+    assert len(objs) == 2
+    assert all(o["kind"] == "PrometheusRule" for o in objs)
+    assert [o["metadata"]["name"] for o in objs] == ["rule-a", "rule-b"]
+
+
 def test_minimal_normalize_strips_status_and_managed_fields() -> None:
     obj = {
         "apiVersion": "v1",
@@ -91,6 +121,19 @@ def test_minimal_normalize_strips_status_and_managed_fields() -> None:
     assert "status" not in normalized
     assert "managedFields" not in normalized["metadata"]
     assert normalized["spec"] == {"a": "b"}
+
+
+def test_minimal_normalize_strips_helm_managed_by_label() -> None:
+    merged = {
+        "metadata": {"name": "d", "labels": {"app": "x"}},
+    }
+    live = {
+        "metadata": {
+            "name": "d",
+            "labels": {"app": "x", "app.kubernetes.io/managed-by": "Helm"},
+        },
+    }
+    assert minimal_normalize(merged) == minimal_normalize(live)
 
 
 def test_normalize_strips_noise() -> None:
@@ -523,10 +566,152 @@ def test_run_drift_detects_deployment_replica_change(
     assert "merged/" in dep.diff
 
 
+def test_should_skip_namespace_system_objects() -> None:
+    assert _should_skip_extras_list_item(
+        {"kind": "ConfigMap", "metadata": {"name": "kube-root-ca.crt"}},
+    )
+    assert _should_skip_extras_list_item(
+        {"kind": "ServiceAccount", "metadata": {"name": "default"}},
+    )
+
+
 def test_should_skip_helm_release_storage_secret_from_extras_scan() -> None:
-    assert _should_skip_extras_list_item({"kind": "Secret", "type": "helm.sh/release.v1"})
-    assert not _should_skip_extras_list_item({"kind": "Secret", "type": "Opaque"})
-    assert not _should_skip_extras_list_item({"kind": "ConfigMap"})
+    assert _should_skip_extras_list_item(
+        {"kind": "Secret", "type": "helm.sh/release.v1", "metadata": {"name": "x"}},
+    )
+    assert not _should_skip_extras_list_item(
+        {"kind": "Secret", "type": "Opaque", "metadata": {"name": "x"}},
+    )
+    assert not _should_skip_extras_list_item(
+        {"kind": "ConfigMap", "metadata": {"name": "x"}},
+    )
+
+
+def test_should_not_skip_manual_secret_with_owner_reference() -> None:
+    assert not _should_skip_extras_list_item(
+        {
+            "kind": "Secret",
+            "type": "Opaque",
+            "metadata": {
+                "name": "my-secret",
+                "ownerReferences": [{"kind": "Something", "name": "x"}],
+            },
+        },
+    )
+
+
+def test_is_managed_by_helm_release_matches_labels() -> None:
+    md = {
+        "labels": {
+            "meta.helm.sh/release-name": "prometheus",
+            "meta.helm.sh/release-namespace": "monitoring",
+        }
+    }
+    assert _is_managed_by_helm_release(
+        md, release_name="prometheus", release_namespace="monitoring"
+    )
+    assert not _is_managed_by_helm_release(
+        md, release_name="other", release_namespace="monitoring"
+    )
+    assert not _is_managed_by_helm_release(
+        {"labels": {"app": "x"}}, release_name="prometheus", release_namespace="monitoring"
+    )
+
+
+def test_collect_extras_live_finds_non_helm_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Res:
+        kind = "ConfigMap"
+        api_version = "v1"
+        group_version = "v1"
+        namespaced = True
+
+    listed = {
+        "apiVersion": "v1",
+        "kind": "List",
+        "items": [
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "helm-cm",
+                    "namespace": "monitoring",
+                    "labels": {
+                        "meta.helm.sh/release-name": "prometheus",
+                        "meta.helm.sh/release-namespace": "monitoring",
+                    },
+                },
+            },
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "manual-install",
+                    "namespace": "monitoring",
+                },
+            },
+        ],
+    }
+
+    class _Dyn:
+        def get(self, resource, namespace=None, **kwargs):  # noqa: ANN001, ARG002
+            return type("I", (), {"to_dict": lambda self: listed})()
+
+    monkeypatch.setattr(
+        "helmadm.drift._iter_extras_api_resources",
+        lambda _dyn: [("v1", "ConfigMap", _Res())],
+    )
+
+    extras, errs = _collect_extras_live(
+        _Dyn(),
+        release_namespace="monitoring",
+        release_name="prometheus",
+        manifest_keys=set(),
+    )
+    assert not errs
+    assert len(extras) == 1
+    assert extras[0].name == "manual-install"
+
+
+def test_collect_extras_skips_objects_in_release_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Res:
+        kind = "Deployment"
+        api_version = "apps/v1"
+        group_version = "apps/v1"
+        namespaced = True
+
+    listed = {
+        "apiVersion": "apps/v1",
+        "kind": "List",
+        "items": [
+            {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "provisioner", "namespace": "openebs"},
+            },
+        ],
+    }
+
+    class _Dyn:
+        def get(self, resource, namespace=None, **kwargs):  # noqa: ANN001, ARG002
+            return type("I", (), {"to_dict": lambda self: listed})()
+
+    monkeypatch.setattr(
+        "helmadm.drift._iter_extras_api_resources",
+        lambda _dyn: [("apps/v1", "Deployment", _Res())],
+    )
+
+    extras, errs = _collect_extras_live(
+        _Dyn(),
+        release_namespace="openebs",
+        release_name="openebs",
+        manifest_keys={("apps/v1", "Deployment", "openebs", "provisioner")},
+    )
+    assert not errs
+    assert extras == []
 
 
 def test_run_drift_manifest_matches_live(monkeypatch: pytest.MonkeyPatch, sample_release: dict) -> None:
@@ -638,7 +823,17 @@ def test_run_drift_extras_flag(monkeypatch: pytest.MonkeyPatch, sample_release: 
 
     monkeypatch.setattr(
         "helmadm.drift._collect_extras_live",
-        lambda *_a, **_k: ([("v1", "Pod", "monitoring", "orphan-pod")], []),
+        lambda *_a, **_k: (
+            [
+                ExtraObjectResult(
+                    api_version="v1",
+                    kind="Secret",
+                    namespace="monitoring",
+                    name="orphan-secret",
+                )
+            ],
+            [],
+        ),
     )
 
     dyn = FakeDynamicClient()
@@ -650,13 +845,14 @@ def test_run_drift_extras_flag(monkeypatch: pytest.MonkeyPatch, sample_release: 
         detect_extras=True,
     )
     assert report.has_problem
-    assert ("v1", "Pod", "monitoring", "orphan-pod") in report.extras
+    assert any(e.name == "orphan-secret" for e in report.extras)
 
 
 def test_drift_ssa_annotation_lines() -> None:
     notes = drift_ssa_annotation_lines()
     assert any("SSA dry-run merged" in line for line in notes)
     assert any("managedFields" in line for line in notes)
+    assert any("managed-by" in line for line in notes)
 
 
 def test_drift_ignore_annotation_lines_service_includes_service_rules() -> None:
@@ -812,6 +1008,59 @@ def test_cli_drift_ignore_annotations(
     assert result.exit_code == 1
     assert "compares SSA dry-run merged vs live" in result.stdout
     assert "--ignore-annotations / -ia" in result.stdout
+
+
+def test_fetch_live_object_uses_dyn_get_when_discovery_returns_resource_list() -> None:
+    """ResourceList defines get(body); live fetch must use DynamicClient.get instead."""
+    from kubernetes.dynamic.resource import Resource, ResourceList
+
+    manifest_obj = {
+        "apiVersion": "monitoring.coreos.com/v1",
+        "kind": "Prometheus",
+        "metadata": {
+            "name": "prometheus-kube-prometheus-prometheus",
+            "namespace": "monitoring",
+        },
+    }
+    from unittest.mock import MagicMock
+
+    k8s_client = MagicMock()
+    base = Resource(
+        prefix="apis",
+        group="monitoring.coreos.com",
+        api_version="v1",
+        kind="Prometheus",
+        namespaced=True,
+        verbs=["get"],
+        name="prometheuses",
+        client=k8s_client,
+    )
+    resource_list = ResourceList(
+        k8s_client,
+        group="monitoring.coreos.com",
+        api_version="v1",
+        base_kind="Prometheus",
+        kind="PrometheusList",
+    )
+    k8s_client.resources.get.side_effect = lambda **kw: (
+        resource_list
+        if kw.get("kind") == "Prometheus"
+        and kw.get("api_version") == "monitoring.coreos.com/v1"
+        else base
+    )
+
+    class _Dyn:
+        def get(self, resource, name=None, namespace=None, **_kw):  # noqa: ANN001
+            assert resource is base
+            assert name == manifest_obj["metadata"]["name"]
+            assert namespace == "monitoring"
+            return type("Inst", (), {"to_dict": lambda self: manifest_obj})()
+
+        resources = k8s_client.resources
+
+    live, err = fetch_live_object(_Dyn(), manifest_obj, release_namespace="monitoring")
+    assert err is None
+    assert live == manifest_obj
 
 
 def test_cli_empty_manifest_reports_error(

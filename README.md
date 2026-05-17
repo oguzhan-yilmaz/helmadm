@@ -70,7 +70,7 @@ Detailed output includes chart, version, and `NEEDS_REPO_URL` when `argocd-yaml`
 
 ```bash
 helmadm drift -n monitoring prometheus
-helmadm drift -n monitoring prometheus --detect-extras
+helmadm drift -n monitoring prometheus --detect-extras   # objects not managed by the release
 helmadm drift -ia -n kube-system traefik   # show compare notes
 helmadm drift --compare-mode legacy -n monitoring prometheus
 ```
