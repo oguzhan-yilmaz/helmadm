@@ -113,10 +113,10 @@ def main(
     \b
     Commands:
 
-      [cyan]argocd-yaml[/cyan]  Build an Argo CD Application manifest from a release
-      [cyan]pull[/cyan]         Export a reproducible Helm install bundle (values + README)
       [cyan]ls[/cyan]           List Helm releases (Helm 3 secret storage)
       [cyan]drift[/cyan]        Compare the release's stored manifest to live objects (read-only)
+      [cyan]argocd-yaml[/cyan]  Build an Argo CD Application manifest from a release
+      [cyan]pull[/cyan]         Export a reproducible Helm install bundle (values + README)
     """
     logging_config.setup_logging(verbose=verbose)
     logger.debug("logging configured (verbose=%s)", verbose)

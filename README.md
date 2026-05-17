@@ -1,119 +1,103 @@
 # helmadm
 
-CLI tools for Helm 3 releases stored in Kubernetes: generate Argo CD `Application` YAML, export reproducible Helm install bundles, list releases, and compare a release manifest to live cluster objects. No `helm` or `kubectl` binary required for helmadm itself.
+Inspect Helm 3 releases in Kubernetes: list releases, detect manifest drift, generate Argo CD `Application` YAML, and export reproducible install bundles. Uses the Kubernetes API only — no `helm` or `kubectl` binary required.
 
-## Requirements
-
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
-- Access to a Kubernetes cluster (kubeconfig or in-cluster)
+**Requirements:** Python 3.12+, kubeconfig (or in-cluster) access to the cluster.
 
 ## Install
 
+**Recommended — [uv](https://docs.astral.sh/uv/) + `uvx` (no global install):**
+
 ```bash
-uv sync
+uvx helmadm ls
 ```
+
+Add a shell alias so `helmadm` always runs the latest from PyPI:
+
+```bash
+alias helmadm='uvx helmadm'
+```
+
+**Global tool with uv:**
+
+```bash
+uv tool install helmadm
+helmadm --help
+```
+
+**pip / pipx:**
+
+```bash
+pip install helmadm
+# or: pipx install helmadm
+```
+
+**From source (development):**
+
+```bash
+# in a clone of this repository
+uv sync
+uv run helmadm --help
+```
+
+See [docs/develop/dev-uv.md](docs/develop/dev-uv.md) for building and publishing.
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `argocd-yaml` | Print an Argo CD `Application` manifest for a release (stdout) |
-| `pull` | Export a reproducible Helm install bundle (values files + README) |
-| `ls` | List Helm releases in the cluster |
-| `drift` | Compare the release's stored manifest to live objects (read-only) |
+| `ls` | List Helm releases (Helm 3 secret storage) |
+| `drift` | Compare release manifest to live objects (read-only) |
+| `argocd-yaml` | Print an Argo CD `Application` manifest |
+| `pull` | Export a reproducible Helm install bundle |
 
 ```bash
-uv run helmadm --help
-uv run helmadm argocd-yaml --help
-uv run helmadm pull --help
-uv run helmadm ls --help
-uv run helmadm drift --help
+helmadm --help
+helmadm ls --help
 ```
 
-### `argocd-yaml` — Application manifest
-
-Reads the release from cluster storage, diffs coalesced chart values + user config against `helm show values` for the chart version (fetched from the chart repo), and writes overrides to `spec.source.helm.valuesObject`. Non-helm fields use `CHANGE_ME` placeholders.
+### `ls`
 
 ```bash
-uv run helmadm ls -n monitoring
-uv run helmadm argocd-yaml -n monitoring prometheus
+helmadm ls
+helmadm ls -n monitoring
+helmadm ls --no-detail
 ```
 
-If the release has no `chart.metadata.repoURL`, pass the repository URL (see `NEEDS_REPO_URL` in `ls`):
+Detailed output includes chart, version, and `NEEDS_REPO_URL` when `argocd-yaml` / `pull` need `--repo-url`.
+
+### `drift`
 
 ```bash
-uv run helmadm argocd-yaml -n monitoring prometheus \
+helmadm drift -n monitoring prometheus
+helmadm drift -n monitoring prometheus --detect-extras
+helmadm drift -ia -n kube-system traefik   # show normalization notes
+```
+
+Exit `1` on drift, missing objects, fetch errors, or extras (with `--detect-extras`). Pipe to [delta](https://github.com/dandavison/delta): `helmadm drift … | delta -s`.
+
+### `argocd-yaml`
+
+```bash
+helmadm ls -n monitoring
+helmadm argocd-yaml -n monitoring prometheus
+helmadm argocd-yaml -n monitoring prometheus \
   --repo-url https://prometheus-community.github.io/helm-charts
 ```
 
-`--debug` adds a `.debug` block to the YAML (raw values, diff metadata, `ignoreAnnotations`). Remove it before applying to Argo CD.
+Writes overrides to `spec.source.helm.valuesObject`. Fields you must set (destination, project, …) use `CHANGE_ME`. `--debug` adds a `.debug` block — remove before applying to Argo CD.
 
-### `pull` — reproducible install bundle
-
-Reads a release from cluster storage and writes a directory you can use with plain `helm install` / `helm upgrade` (no helmadm or Argo required for reinstall).
+### `pull`
 
 ```bash
-uv run helmadm pull -n loki -o ./bundles fluentbit
+helmadm pull -n loki -o ./bundles fluentbit
+helmadm pull -n monitoring prometheus --revision 3 -o ./bundles
 ```
 
-Creates `./bundles/{namespace}/{release}/` containing:
+Creates `{namespace}/{release}/` with values files, `helmadm-pull-metadata.yaml`, and a `README.md` with plain `helm install` commands. `--tar` writes a gzip bundle to stdout; `--force` overwrites an existing directory.
 
-- `helmadm-pull-metadata.yaml` — when pulled, kubeconfig/context, release and chart info
-- `{chart}.all.values.yaml` — effective values from the cluster (coalesced)
-- `{chart}.changed.values.yaml` — overrides only (diff vs remote chart defaults)
-- `{chart}.remote-all.values.yaml` — chart defaults from the repository
-- `README.md` — helm install/template commands for each values file
+## More documentation
 
-Options:
-
-- `--revision N` — pull a specific Helm release revision (default: latest)
-- `--repo-url` — when the release has no `chart.metadata.repoURL` (see `NEEDS_REPO_URL` in `ls`)
-- `--repo-name` — helm repo alias used in the README (default: derived from the repo URL host)
-- `--tar` — write a gzip tarball of the bundle to stdout instead of leaving files on disk
-- `--force` — overwrite an existing bundle directory
-
-```bash
-uv run helmadm pull -n monitoring prometheus --revision 3 -o ./bundles
-uv run helmadm pull -n loki -o ./bundles fluentbit --tar > fluentbit-bundle.tar.gz
-```
-
-### `ls` — list releases
-
-```bash
-uv run helmadm ls                  # all namespaces, detailed (default)
-uv run helmadm ls -n monitoring    # one namespace
-uv run helmadm ls --no-detail      # name / revision / status only
-```
-
-### `drift` — manifest vs live
-
-```bash
-uv run helmadm drift -n monitoring prometheus
-uv run helmadm drift --detect-extras -n monitoring prometheus
-uv run helmadm drift -ia -n kube-system traefik   # print normalization notes before each diff
-```
-
-Exit `1` on drift, missing objects, fetch errors, or extras (with `--detect-extras`).
-
-### Environment variables
-
-CLI flags take precedence over env vars.
-
-| Flag | Environment variable |
-|------|----------------------|
-| `-n` / `--namespace` | `HELMADM_NAMESPACE` (or current kubeconfig context namespace) |
-| `--context` | `HELMADM_CONTEXT` |
-| `--repo-url` | `HELMADM_REPO_URL` |
-| release name (positional) | `HELMADM_RELEASE_NAME` |
-| (values trace, with `-v`) | `HELMADM_TRACE_VALUES` — per-key logs during `argocd-yaml` |
-| (Kubernetes HTTP) | `HELMADM_K8S_CONNECT_TIMEOUT` — connect timeout in seconds (default: `5`) |
-| (Kubernetes HTTP) | `HELMADM_K8S_READ_TIMEOUT` — read timeout in seconds (default: `60`) |
-
-`--kubeconfig` follows kubectl: use the flag, or `KUBECONFIG` / `~/.kube/config`.
-
-## Development
-
-```bash
-uv run pytest
-```
+- [Command reference](docs/commands.md) — flags, bundle layout, examples
+- [Configuration](docs/configuration.md) — environment variables and kubeconfig
+- [Developer guide](docs/develop/dev-uv.md) — uv, build, PyPI publish

@@ -1,6 +1,6 @@
 # Developer notes: uv
 
-Internal cheat sheet for building and publishing **helmadm**. End users only need `README.md`.
+Internal cheat sheet for building and publishing **helmadm**. End users: [README.md](../../README.md) and [docs/](../).
 
 Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+ (see `requires-python` in `pyproject.toml`).
 
@@ -86,9 +86,9 @@ git push && git push --tags
 Install from PyPI (sanity check):
 
 ```bash
+uvx helmadm --help
 uv tool install helmadm
 # or: pip install helmadm
-helmadm --help
 ```
 
 ## Useful flags
