@@ -64,6 +64,7 @@ from helmadm.values_diff import (
     extract_values_from_release,
     resolve_values_object,
 )
+from helmadm.version_info import fetch_pypi_version, format_version_lines, get_version
 
 logger = logging_config.get_logger("cli")
 
@@ -118,6 +119,7 @@ def main(
       [cyan]drift[/cyan]        Compare the release's stored manifest to live objects (read-only)
       [cyan]argocd-yaml[/cyan]  Build an Argo CD Application manifest from a release
       [cyan]pull[/cyan]         Export a reproducible Helm install bundle (values + README)
+      [cyan]version[/cyan]      Show installed version (and PyPI update hint when newer)
     """
     logging_config.setup_logging(verbose=verbose)
     logger.debug("logging configured (verbose=%s)", verbose)
@@ -1188,6 +1190,32 @@ def ls(
             context=resolved_context,
         )
     )
+
+
+@app.command(
+    "version",
+    help="Show installed version and optional PyPI update hint.",
+)
+def version_command(
+    no_pypi_check: Annotated[
+        bool,
+        typer.Option(
+            "--no-pypi-check",
+            help="Do not query PyPI for a newer release.",
+            rich_help_panel=PANEL_GLOBAL,
+        ),
+    ] = False,
+) -> None:
+    """
+    Print the installed version and compare to the latest release on PyPI.
+
+    When yours is older, suggests [cyan]pip install --upgrade helmadm[/cyan] or
+    [cyan]uv tool upgrade helmadm[/cyan].
+    """
+    current = get_version()
+    latest = None if no_pypi_check else fetch_pypi_version()
+    for line in format_version_lines(current=current, latest=latest):
+        typer.echo(line)
 
 
 def cli_entry() -> None:
