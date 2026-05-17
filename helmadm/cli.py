@@ -64,7 +64,12 @@ from helmadm.values_diff import (
     extract_values_from_release,
     resolve_values_object,
 )
-from helmadm.version_info import fetch_pypi_version, format_version_lines, get_version
+from helmadm.version_info import (
+    VersionOutputFormat,
+    fetch_pypi_version,
+    format_version,
+    get_version,
+)
 
 logger = logging_config.get_logger("cli")
 
@@ -1197,6 +1202,16 @@ def ls(
     help="Show installed version and optional PyPI update hint.",
 )
 def version_command(
+    output: Annotated[
+        VersionOutputFormat,
+        typer.Option(
+            "-o",
+            "--output",
+            help="Output format: yaml (default) or text.",
+            case_sensitive=False,
+            rich_help_panel=PANEL_GLOBAL,
+        ),
+    ] = "yaml",
     no_pypi_check: Annotated[
         bool,
         typer.Option(
@@ -1209,13 +1224,21 @@ def version_command(
     """
     Print the installed version and compare to the latest release on PyPI.
 
-    When yours is older, suggests [cyan]pip install --upgrade helmadm[/cyan] or
+    Default output is YAML. When yours is older, includes [cyan]upgrade[/cyan]
+    hints for [cyan]pip install --upgrade helmadm[/cyan] and
     [cyan]uv tool upgrade helmadm[/cyan].
     """
     current = get_version()
-    latest = None if no_pypi_check else fetch_pypi_version()
-    for line in format_version_lines(current=current, latest=latest):
-        typer.echo(line)
+    pypi_checked = not no_pypi_check
+    latest = fetch_pypi_version() if pypi_checked else None
+    typer.echo(
+        format_version(
+            current=current,
+            latest=latest,
+            pypi_checked=pypi_checked,
+            output=output,
+        ).rstrip("\n")
+    )
 
 
 def cli_entry() -> None:
