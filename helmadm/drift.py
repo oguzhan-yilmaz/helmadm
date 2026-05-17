@@ -16,6 +16,12 @@ from kubernetes.dynamic.exceptions import GoneError as DynamicGoneError
 from kubernetes.dynamic.exceptions import NotFoundError as DynamicNotFoundError
 from kubernetes.dynamic.resource import ResourceList
 
+from helmadm.drift_ssa import (
+    DriftCompareMode,
+    SSAUnsupportedError,
+    minimal_normalize,
+    ssa_merged_object,
+)
 from helmadm.env import get_k8s_request_timeout
 from helmadm.logging_config import get_logger
 
@@ -45,12 +51,16 @@ class ManifestObjectResult:
     severity: DriftSeverity = "ok"
     detail: str = ""
     diff: str | None = None
+    compare_method: DriftCompareMode | None = None
+    legacy_fallback_reason: str = ""
 
 
 @dataclass
 class DriftReport:
     release_name: str
     namespace: str
+    compare_mode: DriftCompareMode = "ssa"
+    field_manager: str = "helm"
     items: list[ManifestObjectResult] = field(default_factory=list)
     extras: list[tuple[str, str, str, str]] = field(default_factory=list)
     """(apiVersion, kind, namespace, name) live objects in `-n` missing from manifest."""
@@ -125,6 +135,15 @@ _WORKLOAD_POD_TEMPLATE_KINDS = frozenset(
         "StatefulSet",
     }
 )
+
+
+def drift_ssa_annotation_lines() -> list[str]:
+    """Human-readable ``# helmadm:`` lines for SSA merged-vs-live diffs."""
+    return [
+        "# helmadm: Unified diff below compares SSA dry-run merged vs live.",
+        "# helmadm: Stripped before compare/diff: status; metadata.managedFields.",
+        "# helmadm: Merged = API server result of apply-patch dry-run (field manager helm).",
+    ]
 
 
 def drift_ignore_annotation_lines(kind: str) -> list[str]:
@@ -511,11 +530,22 @@ def _unified_diff_filenames(
     kind: str,
     namespace: str,
     name: str,
+    *,
+    from_prefix: str = "manifest",
 ) -> tuple[str, str]:
     """Paths shown in unified-diff headers (readable in delta / git-style viewers)."""
     ns_seg = namespace.strip() if namespace.strip() else "cluster-scoped"
     core = f"{api_version}/{kind}/{ns_seg}/{name}"
-    return (f"manifest/{core}", f"live/{core}")
+    return (f"{from_prefix}/{core}", f"live/{core}")
+
+
+def _canonical_yaml_for_ssa_diff(obj: dict[str, Any]) -> str:
+    return yaml.safe_dump(
+        minimal_normalize(obj),
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
 
 
 def _unified_yaml_diff(
@@ -526,10 +556,18 @@ def _unified_yaml_diff(
     kind: str,
     namespace: str,
     name: str,
+    compare_method: DriftCompareMode = "legacy",
 ) -> str:
-    from_file, to_file = _unified_diff_filenames(api_version, kind, namespace, name)
-    a = canonical_yaml_for_diff(expected_obj, drift_side="manifest").splitlines(True)
-    b = canonical_yaml_for_diff(live_obj, drift_side="live").splitlines(True)
+    from_prefix = "merged" if compare_method == "ssa" else "manifest"
+    from_file, to_file = _unified_diff_filenames(
+        api_version, kind, namespace, name, from_prefix=from_prefix
+    )
+    if compare_method == "ssa":
+        a = _canonical_yaml_for_ssa_diff(expected_obj).splitlines(True)
+        b = _canonical_yaml_for_ssa_diff(live_obj).splitlines(True)
+    else:
+        a = canonical_yaml_for_diff(expected_obj, drift_side="manifest").splitlines(True)
+        b = canonical_yaml_for_diff(live_obj, drift_side="live").splitlines(True)
     lines_list = list(
         difflib.unified_diff(
             a,
@@ -623,6 +661,76 @@ def _collect_extras_live(
     return extra_keys_sorted, errs
 
 
+def _ssa_drift_detail(merged: dict[str, Any], live: dict[str, Any]) -> str:
+    merged_replicas = effective_spec_replicas(merged)
+    live_replicas = effective_spec_replicas(live)
+    if (
+        merged_replicas is not None
+        and live_replicas is not None
+        and merged_replicas != live_replicas
+    ):
+        return (
+            f"spec.replicas differs (merged {merged_replicas}, live {live_replicas})"
+        )
+    return "SSA merged object differs from live object"
+
+
+def _legacy_compare_object(
+    obj: dict[str, Any],
+    live: dict[str, Any],
+    *,
+    api_version: str,
+    kind: str,
+    namespace: str,
+    name: str,
+) -> ManifestObjectResult:
+    expected_norm_dict = normalize_for_compare(obj, drift_side="manifest")
+    live_norm = normalize_for_compare(live, drift_side="live")
+    replica_drift = replicas_mismatch(obj, live)
+    if replica_drift:
+        logger.debug(
+            "replica drift %s/%s %s: manifest=%s live=%s",
+            kind,
+            name,
+            namespace,
+            effective_spec_replicas(obj),
+            effective_spec_replicas(live),
+        )
+    if expected_norm_dict == live_norm and not replica_drift:
+        return ManifestObjectResult(
+            api_version=api_version,
+            kind=kind,
+            namespace=namespace,
+            name=name,
+            severity="ok",
+            compare_method="legacy",
+        )
+    detail = "release manifest differs from live object spec/metadata"
+    if replica_drift:
+        detail = (
+            f"spec.replicas differs (manifest "
+            f"{effective_spec_replicas(obj)}, live {effective_spec_replicas(live)})"
+        )
+    return ManifestObjectResult(
+        api_version=api_version,
+        kind=kind,
+        namespace=namespace,
+        name=name,
+        severity="drift",
+        detail=detail,
+        compare_method="legacy",
+        diff=_unified_yaml_diff(
+            obj,
+            live,
+            api_version=api_version,
+            kind=kind,
+            namespace=namespace,
+            name=name,
+            compare_method="legacy",
+        ),
+    )
+
+
 def run_drift(
     dyn: DynamicClient,
     release: dict[str, Any],
@@ -630,9 +738,17 @@ def run_drift(
     release_namespace: str,
     release_name: str,
     detect_extras: bool,
+    compare_mode: DriftCompareMode = "ssa",
+    field_manager: str = "helm",
+    verbose: bool = False,
 ) -> DriftReport:
     objs = parse_release_manifest(release)
-    report = DriftReport(release_name=release_name, namespace=release_namespace)
+    report = DriftReport(
+        release_name=release_name,
+        namespace=release_namespace,
+        compare_mode=compare_mode,
+        field_manager=field_manager,
+    )
     manifest_keys: set[tuple[str, str, str, str]] = set()
 
     for obj in objs:
@@ -658,7 +774,6 @@ def run_drift(
         live, err_msg = fetch_live_object(
             dyn, obj, release_namespace=release_namespace
         )
-        expected_norm_dict = normalize_for_compare(obj, drift_side="manifest")
 
         if err_msg and err_msg not in {"missing", "gone"}:
             report.items.append(
@@ -704,49 +819,97 @@ def run_drift(
             )
             continue
 
-        live_norm = normalize_for_compare(live, drift_side="live")
-        replica_drift = replicas_mismatch(obj, live)
-        if replica_drift:
+        item_ns = ns_eff or release_namespace
+
+        if compare_mode == "legacy":
+            report.items.append(
+                _legacy_compare_object(
+                    obj,
+                    live,
+                    api_version=api_version,
+                    kind=kind,
+                    namespace=item_ns,
+                    name=nm,
+                )
+            )
+            continue
+
+        use_legacy = False
+        legacy_reason = ""
+        merged: dict[str, Any] | None = None
+        try:
+            merged = ssa_merged_object(
+                dyn,
+                obj,
+                resolved_namespace=ns_eff or None,
+                field_manager=field_manager,
+            )
+        except SSAUnsupportedError as exc:
+            use_legacy = True
+            legacy_reason = str(exc)
             logger.debug(
-                "replica drift %s/%s %s: manifest=%s live=%s",
+                "SSA unavailable for %s/%s %s: %s",
+                api_version,
                 kind,
                 nm,
-                ns_eff or release_namespace,
-                effective_spec_replicas(obj),
-                effective_spec_replicas(live),
+                exc,
             )
-        if expected_norm_dict == live_norm and not replica_drift:
+
+        if use_legacy:
+            result = _legacy_compare_object(
+                obj,
+                live,
+                api_version=api_version,
+                kind=kind,
+                namespace=item_ns,
+                name=nm,
+            )
+            result.legacy_fallback_reason = legacy_reason
+            if verbose and legacy_reason:
+                result.detail = (
+                    f"{result.detail}; legacy fallback: {legacy_reason}"
+                    if result.detail and result.severity == "drift"
+                    else (
+                        f"legacy fallback: {legacy_reason}"
+                        if result.severity == "ok"
+                        else result.detail
+                    )
+                )
+            report.items.append(result)
+            continue
+
+        assert merged is not None
+        merged_norm = minimal_normalize(merged)
+        live_norm = minimal_normalize(live)
+        if merged_norm == live_norm:
             report.items.append(
                 ManifestObjectResult(
                     api_version=api_version,
                     kind=kind,
-                    namespace=(ns_eff or release_namespace),
+                    namespace=item_ns,
                     name=nm,
                     severity="ok",
+                    compare_method="ssa",
                 )
             )
         else:
-            detail = "release manifest differs from live object spec/metadata"
-            if replica_drift:
-                detail = (
-                    f"spec.replicas differs (manifest "
-                    f"{effective_spec_replicas(obj)}, live {effective_spec_replicas(live)})"
-                )
             report.items.append(
                 ManifestObjectResult(
                     api_version=api_version,
                     kind=kind,
-                    namespace=(ns_eff or release_namespace),
+                    namespace=item_ns,
                     name=nm,
                     severity="drift",
-                    detail=detail,
+                    detail=_ssa_drift_detail(merged, live),
+                    compare_method="ssa",
                     diff=_unified_yaml_diff(
-                        obj,
+                        merged,
                         live,
                         api_version=api_version,
                         kind=kind,
-                        namespace=(ns_eff or release_namespace),
+                        namespace=item_ns,
                         name=nm,
+                        compare_method="ssa",
                     ),
                 )
             )
@@ -767,19 +930,35 @@ def format_report_text(
     report: DriftReport,
     *,
     ignore_annotations: bool = False,
+    verbose: bool = False,
 ) -> str:
     lines: list[str] = []
     hr = "=" * 64
     lines.append(hr)
+    compare_desc = (
+        "SSA dry-run merged vs live API"
+        if report.compare_mode == "ssa"
+        else "legacy manifest normalization vs live API"
+    )
     lines.append(
         f"Helm drift: release {report.release_name!r} "
-        f"namespace {report.namespace!r} (stored release manifest vs live API; read-only)"
+        f"namespace {report.namespace!r} ({compare_desc}; read-only)"
     )
-    if ignore_annotations:
+    if report.compare_mode == "ssa":
         lines.append(
-            "# helmadm: --ignore-annotations / -ia: normalization rules per drift item "
-            "(see helmadm drift --help)."
+            f"# helmadm: compare-mode=ssa field-manager={report.field_manager!r}"
         )
+    if ignore_annotations:
+        if report.compare_mode == "ssa":
+            lines.append(
+                "# helmadm: --ignore-annotations / -ia: notes per drift item "
+                "(SSA merged vs live; legacy fallback uses normalization rules)."
+            )
+        else:
+            lines.append(
+                "# helmadm: --ignore-annotations / -ia: normalization rules per drift item "
+                "(see helmadm drift --help)."
+            )
     lines.append(hr)
 
     severity_order = {"fetch_error": 0, "missing": 1, "drift": 2, "ok": 3}
@@ -796,10 +975,23 @@ def format_report_text(
         lines.append(f"{prefix} {ident}")
         if item.detail.strip():
             lines.append(f"    {item.detail}")
+        if (
+            verbose
+            and item.legacy_fallback_reason
+            and item.compare_method == "legacy"
+        ):
+            lines.append(
+                f"    # helmadm: SSA unavailable, legacy compare: "
+                f"{item.legacy_fallback_reason}"
+            )
         if item.diff and item.severity == "drift":
             if ignore_annotations:
-                for note in drift_ignore_annotation_lines(item.kind):
-                    lines.append(note)
+                if item.compare_method == "ssa":
+                    for note in drift_ssa_annotation_lines():
+                        lines.append(note)
+                else:
+                    for note in drift_ignore_annotation_lines(item.kind):
+                        lines.append(note)
             for diff_line in item.diff.rstrip().splitlines():
                 lines.append(diff_line.rstrip())
 

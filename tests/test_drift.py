@@ -18,14 +18,32 @@ from helmadm.drift import (
     _should_skip_extras_list_item,
     _unified_yaml_diff,
     drift_ignore_annotation_lines,
+    drift_ssa_annotation_lines,
     format_report_text,
     normalize_for_compare,
     parse_release_manifest,
     run_drift,
 )
+from helmadm.drift_ssa import (
+    SSAUnsupportedError,
+    minimal_normalize,
+    ssa_merged_object,
+)
 from helmadm.env import ENV_NAMESPACE, ENV_RELEASE_NAME
 
 runner = CliRunner()
+
+
+def _mock_ssa_returns_manifest(
+    _dyn: object,
+    manifest_obj: dict,
+    *,
+    resolved_namespace: str | None,  # noqa: ARG001
+    field_manager: str = "helm",  # noqa: ARG001
+) -> dict:
+    merged = copy.deepcopy(manifest_obj)
+    merged.pop("status", None)
+    return merged
 
 
 class _FakeDynDiscovery:
@@ -56,6 +74,23 @@ def test_parse_release_manifest_empty_returns_empty(sample_release: dict) -> Non
     r = dict(sample_release)
     r.pop("manifest", None)
     assert parse_release_manifest(r) == []
+
+
+def test_minimal_normalize_strips_status_and_managed_fields() -> None:
+    obj = {
+        "apiVersion": "v1",
+        "kind": "Foo",
+        "metadata": {
+            "name": "n",
+            "managedFields": [{"manager": "helm"}],
+        },
+        "status": {"x": 1},
+        "spec": {"a": "b"},
+    }
+    normalized = minimal_normalize(obj)
+    assert "status" not in normalized
+    assert "managedFields" not in normalized["metadata"]
+    assert normalized["spec"] == {"a": "b"}
 
 
 def test_normalize_strips_noise() -> None:
@@ -174,6 +209,20 @@ def test_normalize_keeps_manifest_node_port_for_compare() -> None:
         live_svc,
         drift_side="live",
     )
+
+
+def test_unified_yaml_diff_ssa_uses_merged_prefix() -> None:
+    diff = _unified_yaml_diff(
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x"}, "data": {"a": "1"}},
+        {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x"}, "data": {"a": "2"}},
+        api_version="v1",
+        kind="ConfigMap",
+        namespace="ns",
+        name="x",
+        compare_method="ssa",
+    )
+    assert "merged/v1/ConfigMap/ns/x" in diff
+    assert "live/v1/ConfigMap/ns/x" in diff
 
 
 def test_unified_yaml_diff_headers_include_resource_identity() -> None:
@@ -366,6 +415,65 @@ def test_replicas_mismatch_detects_scaled_deployment() -> None:
     )
 
 
+def test_ssa_merged_object_calls_server_side_apply(monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "cm", "namespace": "ns"},
+        "data": {"k": "v"},
+    }
+    calls: list[dict] = []
+
+    class _Res:
+        namespaced = True
+
+    class _Dyn:
+        resources = type("R", (), {"get": staticmethod(lambda **_: _Res())})()
+
+        def server_side_apply(self, resource, body=None, **kwargs):  # noqa: ANN001, ARG002
+            calls.append(kwargs)
+            return type("I", (), {"to_dict": lambda self: body})()
+
+    merged = ssa_merged_object(
+        _Dyn(),
+        manifest,
+        resolved_namespace="ns",
+        field_manager="helm",
+    )
+    assert merged["data"]["k"] == "v"
+    assert calls[0]["dry_run"] == "All"
+    assert calls[0]["field_manager"] == "helm"
+
+
+def test_ssa_merged_object_raises_ssa_unsupported_on_api_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kubernetes.client.rest import ApiException
+    from kubernetes.dynamic.exceptions import DynamicApiError
+
+    class _Res:
+        namespaced = True
+
+    class _Dyn:
+        resources = type("R", (), {"get": staticmethod(lambda **_: _Res())})()
+
+        def server_side_apply(self, *args, **kwargs):  # noqa: ANN002, ARG002
+            api_exc = ApiException(status=415, reason="Unsupported Media Type")
+            api_exc.body = "must use application/apply-patch+yaml"
+            raise DynamicApiError(api_exc)
+
+    with pytest.raises(SSAUnsupportedError):
+        ssa_merged_object(
+            _Dyn(),
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "cm"},
+            },
+            resolved_namespace="ns",
+        )
+
+
 def test_run_drift_detects_deployment_replica_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -393,6 +501,9 @@ def test_run_drift_detects_deployment_replica_change(
         return live, None
 
     monkeypatch.setattr("helmadm.drift.fetch_live_object", _fetch)
+    monkeypatch.setattr(
+        "helmadm.drift.ssa_merged_object", _mock_ssa_returns_manifest
+    )
 
     dyn = FakeDynamicClient()
     report = run_drift(
@@ -405,8 +516,11 @@ def test_run_drift_detects_deployment_replica_change(
     assert report.has_problem
     dep = next(it for it in report.items if it.kind == "Deployment")
     assert dep.severity == "drift"
+    assert dep.compare_method == "ssa"
     assert "spec.replicas differs" in dep.detail
+    assert "merged" in dep.detail
     assert dep.diff and "replicas" in dep.diff
+    assert "merged/" in dep.diff
 
 
 def test_should_skip_helm_release_storage_secret_from_extras_scan() -> None:
@@ -419,6 +533,9 @@ def test_run_drift_manifest_matches_live(monkeypatch: pytest.MonkeyPatch, sample
     monkeypatch.setattr(
         "helmadm.drift.fetch_live_object",
         lambda dyn, obj, *, release_namespace: (copy.deepcopy(obj), None),
+    )
+    monkeypatch.setattr(
+        "helmadm.drift.ssa_merged_object", _mock_ssa_returns_manifest
     )
     dyn = FakeDynamicClient()
     report = run_drift(
@@ -440,6 +557,9 @@ def test_run_drift_detects_difference(monkeypatch: pytest.MonkeyPatch, sample_re
         return live, None
 
     monkeypatch.setattr("helmadm.drift.fetch_live_object", _fake_fetch)
+    monkeypatch.setattr(
+        "helmadm.drift.ssa_merged_object", _mock_ssa_returns_manifest
+    )
 
     dyn = FakeDynamicClient()
     report = run_drift(
@@ -451,14 +571,69 @@ def test_run_drift_detects_difference(monkeypatch: pytest.MonkeyPatch, sample_re
     )
     assert report.has_problem
     assert report.items[0].severity == "drift"
+    assert report.items[0].compare_method == "ssa"
     assert report.items[0].diff
-    assert "manifest/v1/ConfigMap/monitoring/drift-cm" in report.items[0].diff
+    assert "merged/v1/ConfigMap/monitoring/drift-cm" in report.items[0].diff
+
+
+def test_run_drift_ssa_fallback_to_legacy(
+    monkeypatch: pytest.MonkeyPatch, sample_release: dict
+) -> None:
+    monkeypatch.setattr(
+        "helmadm.drift.fetch_live_object",
+        lambda dyn, obj, *, release_namespace: (copy.deepcopy(obj), None),
+    )
+
+    def _ssa_fail(*_a, **_k):  # noqa: ANN002
+        raise SSAUnsupportedError("CRD does not support apply-patch")
+
+    monkeypatch.setattr("helmadm.drift.ssa_merged_object", _ssa_fail)
+
+    dyn = FakeDynamicClient()
+    report = run_drift(
+        dyn,
+        sample_release,
+        release_namespace="monitoring",
+        release_name="prometheus",
+        detect_extras=False,
+        verbose=True,
+    )
+    assert not report.has_problem
+    assert report.items[0].compare_method == "legacy"
+    assert report.items[0].legacy_fallback_reason
+
+
+def test_run_drift_legacy_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, sample_release: dict
+) -> None:
+    def _fake_fetch(dyn: object, obj: dict, *, release_namespace: str) -> tuple:  # noqa: ARG001
+        live = copy.deepcopy(obj)
+        live.setdefault("data", {})["key"] = "CHANGED"
+        return live, None
+
+    monkeypatch.setattr("helmadm.drift.fetch_live_object", _fake_fetch)
+
+    dyn = FakeDynamicClient()
+    report = run_drift(
+        dyn,
+        sample_release,
+        release_namespace="monitoring",
+        release_name="prometheus",
+        detect_extras=False,
+        compare_mode="legacy",
+    )
+    assert report.has_problem
+    assert report.items[0].compare_method == "legacy"
+    assert "manifest/v1/ConfigMap/monitoring/drift-cm" in (report.items[0].diff or "")
 
 
 def test_run_drift_extras_flag(monkeypatch: pytest.MonkeyPatch, sample_release: dict) -> None:
     monkeypatch.setattr(
         "helmadm.drift.fetch_live_object",
         lambda dyn, obj, *, release_namespace: (copy.deepcopy(obj), None),
+    )
+    monkeypatch.setattr(
+        "helmadm.drift.ssa_merged_object", _mock_ssa_returns_manifest
     )
 
     monkeypatch.setattr(
@@ -478,6 +653,12 @@ def test_run_drift_extras_flag(monkeypatch: pytest.MonkeyPatch, sample_release: 
     assert ("v1", "Pod", "monitoring", "orphan-pod") in report.extras
 
 
+def test_drift_ssa_annotation_lines() -> None:
+    notes = drift_ssa_annotation_lines()
+    assert any("SSA dry-run merged" in line for line in notes)
+    assert any("managedFields" in line for line in notes)
+
+
 def test_drift_ignore_annotation_lines_service_includes_service_rules() -> None:
     svc_notes = drift_ignore_annotation_lines("Service")
     assert any("Service spec:" in line for line in svc_notes)
@@ -491,6 +672,7 @@ def test_format_report_text_optional_ignore_annotations_before_diff() -> None:
     report = DriftReport(
         release_name="r",
         namespace="ns",
+        compare_mode="legacy",
         items=[
             ManifestObjectResult(
                 api_version="v1",
@@ -499,6 +681,7 @@ def test_format_report_text_optional_ignore_annotations_before_diff() -> None:
                 name="x",
                 severity="drift",
                 detail="differs",
+                compare_method="legacy",
                 diff="--- a\n+++ b\n",
             )
         ],
@@ -512,6 +695,29 @@ def test_format_report_text_optional_ignore_annotations_before_diff() -> None:
     idx_note = ann.index("# helmadm: Unified diff below")
     idx_diff = ann.index("--- a")
     assert idx_header < idx_note < idx_diff
+
+
+def test_format_report_text_ssa_ignore_annotations() -> None:
+    report = DriftReport(
+        release_name="r",
+        namespace="ns",
+        compare_mode="ssa",
+        items=[
+            ManifestObjectResult(
+                api_version="v1",
+                kind="ConfigMap",
+                namespace="ns",
+                name="x",
+                severity="drift",
+                detail="differs",
+                compare_method="ssa",
+                diff="--- a\n+++ b\n",
+            )
+        ],
+    )
+    ann = format_report_text(report, ignore_annotations=True)
+    assert "compare-mode=ssa" in ann
+    assert "SSA dry-run merged" in ann
 
 
 def test_format_report_text_contains_result() -> None:
@@ -536,7 +742,9 @@ def test_format_report_text_contains_result() -> None:
 def test_cli_drift_help() -> None:
     result = runner.invoke(app, ["drift", "--help"])
     assert result.exit_code == 0
-    assert "manifest" in result.stdout.lower()
+    assert "merged" in result.stdout.lower()
+    assert "--compare-mode" in result.stdout
+    assert "--field-manager" in result.stdout
     assert "--ignore-annotations" in result.stdout
     assert "-ia" in result.stdout
 
@@ -550,6 +758,9 @@ def test_cli_drift_sync_exit_zero(
         "helmadm.drift.fetch_live_object",
         lambda dyn, obj, *, release_namespace: (copy.deepcopy(obj), None),
     )
+    monkeypatch.setattr(
+        "helmadm.drift.ssa_merged_object", _mock_ssa_returns_manifest
+    )
 
     with (
         patch("helmadm.cli.load_kubernetes_client"),
@@ -561,6 +772,7 @@ def test_cli_drift_sync_exit_zero(
 
     assert result.exit_code == 0
     assert "[ok]" in result.stdout
+    assert "compare-mode=ssa" in result.stdout
 
 
 def test_cli_drift_ignore_annotations(
@@ -576,6 +788,9 @@ def test_cli_drift_ignore_annotations(
         return live, None
 
     monkeypatch.setattr("helmadm.drift.fetch_live_object", _fetch)
+    monkeypatch.setattr(
+        "helmadm.drift.ssa_merged_object", _mock_ssa_returns_manifest
+    )
 
     with (
         patch("helmadm.cli.load_kubernetes_client"),
@@ -595,7 +810,7 @@ def test_cli_drift_ignore_annotations(
         )
 
     assert result.exit_code == 1
-    assert "# helmadm: Unified diff below" in result.stdout
+    assert "compares SSA dry-run merged vs live" in result.stdout
     assert "--ignore-annotations / -ia" in result.stdout
 
 

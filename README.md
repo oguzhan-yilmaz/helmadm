@@ -71,8 +71,11 @@ Detailed output includes chart, version, and `NEEDS_REPO_URL` when `argocd-yaml`
 ```bash
 helmadm drift -n monitoring prometheus
 helmadm drift -n monitoring prometheus --detect-extras
-helmadm drift -ia -n kube-system traefik   # show normalization notes
+helmadm drift -ia -n kube-system traefik   # show compare notes
+helmadm drift --compare-mode legacy -n monitoring prometheus
 ```
+
+Default compare uses server-side apply dry-run (merged vs live; like `kubectl diff --server-side`). Legacy normalization is used automatically when SSA is unavailable, or with `--compare-mode legacy`.
 
 Exit `1` on drift, missing objects, fetch errors, or extras (with `--detect-extras`). Pipe to [delta](https://github.com/dandavison/delta): `helmadm drift … | delta -s`.
 
