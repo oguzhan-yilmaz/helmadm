@@ -24,6 +24,7 @@ def test_root_help_lists_commands():
     assert "pull" in result.stdout
     assert "ls" in result.stdout
     assert "drift" in result.stdout
+    assert "version" in result.stdout
     assert "--verbose" in result.stdout
 
 
@@ -36,6 +37,31 @@ def test_no_args_shows_root_help(clean_env):
     assert "pull" in result.stdout
     assert "ls" in result.stdout
     assert "drift" in result.stdout
+    assert "version" in result.stdout
+
+
+def test_version_command_prints_yaml(clean_env) -> None:
+    import yaml
+
+    with (
+        patch("helmadm.cli.get_version", return_value="0.2.0"),
+        patch("helmadm.cli.fetch_pypi_version", return_value=None),
+    ):
+        result = runner.invoke(app, ["version", "--no-pypi-check"])
+    assert result.exit_code == 0
+    doc = yaml.safe_load(result.stdout)
+    assert doc == {"name": "helmadm", "version": "0.2.0"}
+
+
+def test_version_command_prints_text(clean_env) -> None:
+    with (
+        patch("helmadm.cli.get_version", return_value="0.2.0"),
+        patch("helmadm.cli.fetch_pypi_version", return_value="0.2.0"),
+    ):
+        result = runner.invoke(app, ["version", "-o", "text"])
+    assert result.exit_code == 0
+    assert "helmadm 0.2.0" in result.stdout
+    assert "latest: 0.2.0" in result.stdout
 
 
 def test_argocd_yaml_help_shows_examples():
