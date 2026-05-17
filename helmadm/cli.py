@@ -769,9 +769,8 @@ def drift_command(
         typer.Option(
             "--detect-extras",
             help=(
-                "LIST every namespaced API kind in -n and flag objects not in the release "
-                "manifest (includes unlabeled resources; needs broad list RBAC). "
-                "Helm release storage secrets (helm.sh/release.v1) are skipped."
+                "List namespace resources and print one [extra] line per object not in this "
+                "release manifest and not labeled meta.helm.sh/release-name for this release."
             ),
             rich_help_panel=PANEL_RELEASE,
         ),
@@ -832,8 +831,8 @@ def drift_command(
 
     Use [cyan]--ignore-annotations[/cyan] / [cyan]-ia[/cyan] to print compare notes above each diff.
 
-    [cyan]--detect-extras[/cyan] reports namespaced objects in [cyan]-n[/cyan] that are absent from
-    the manifest (manual installs, other controllers).
+    [cyan]--detect-extras[/cyan] lists the release namespace and prints one [cyan][extra][/cyan] line
+    per object not managed by this Helm release (no [cyan]meta.helm.sh/release-name[/cyan] label).
 
     Exit [cyan]0[/cyan] when every manifest object matches; [cyan]1[/cyan] on drift, missing object,
     fetch error, or any extra (with [cyan]--detect-extras[/cyan]).
