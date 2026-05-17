@@ -77,7 +77,14 @@ helmadm drift --compare-mode legacy -n monitoring prometheus
 
 Default compare uses server-side apply dry-run (merged vs live; like `kubectl diff --server-side`). Legacy normalization is used automatically when SSA is unavailable, or with `--compare-mode legacy`.
 
-Exit `1` on drift, missing objects, fetch errors, or extras (with `--detect-extras`). Pipe to [delta](https://github.com/dandavison/delta): `helmadm drift … | delta -s`.
+Exit `1` on drift, missing objects, fetch errors, or extras (with `--detect-extras`).
+
+**Nicer diffs:** pipe stdout through [delta](https://github.com/dandavison/delta) (`-s` for side-by-side; `--paging never` when piping so delta does not open its own pager):
+
+```bash
+helmadm drift -n monitoring prometheus --detect-extras | delta -s --paging never
+uv run helmadm drift -n monitoring prometheus --detect-extras | delta -s --paging never
+```
 
 ### `argocd-yaml`
 

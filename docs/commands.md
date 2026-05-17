@@ -44,10 +44,13 @@ When SSA is unavailable for a resource (some CRDs), helmadm automatically falls 
 
 Helm hook manifests are not in `manifest` and are not checked. `kubectl scale` / replica edits on workloads in the manifest should show as drift unless something reconciles them first.
 
+**Viewing diffs with [delta](https://github.com/dandavison/delta):** `drift` prints unified diffs to stdout. Piping through `delta` adds syntax highlighting and a clearer layout (`-s` is side-by-side). Use `--paging never` when you pipe to your own pager or want all output at once (e.g. in CI or a terminal multiplexer).
+
 ```bash
 helmadm drift -n monitoring prometheus
 helmadm drift -n monitoring prometheus | delta -s
-helmadm drift --detect-extras -n monitoring prometheus
+helmadm drift --detect-extras -n monitoring prometheus | delta -s --paging never
+uv run helmadm drift -n monitoring prometheus --detect-extras | delta -s --paging never
 helmadm drift -ia -n kube-system traefik
 helmadm drift --compare-mode legacy -n monitoring prometheus
 helmadm drift -n monitoring blackbox-exporter -ia -v | delta -s --paging never
